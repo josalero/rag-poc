@@ -20,7 +20,10 @@ public class SkillsQueryController {
 
     @PostMapping("/query")
     public ResponseEntity<QueryResponse> query(@Valid @RequestBody QueryRequest request) {
-        QueryResponse response = ragService.query(request.question());
+        QueryResponse response = ragService.query(
+                request.question().trim(),
+                request.maxResults(),
+                request.minScore());
         return ResponseEntity.ok(response);
     }
 }

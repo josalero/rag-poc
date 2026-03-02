@@ -8,6 +8,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
 import java.util.List;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -39,13 +40,13 @@ class SkillsQueryControllerTest {
 
     @Test
     void query_withValidQuestion_returnsOkAndAnswer() throws Exception {
-        when(ragService.query(anyString())).thenReturn(QueryResponse.of(
+        when(ragService.query(anyString(), any(), any())).thenReturn(QueryResponse.of(
                 "Test answer.",
-                List.of(new QueryResponse.SourceSegment("Excerpt from resume.", "resume1.pdf"))));
+                List.of(new QueryResponse.SourceSegment("Excerpt from resume.", "resume1.pdf", 0.93))));
 
         mockMvc.perform(post("/api/query")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"question\":\"Who has Java?\"}"))
+                        .content("{\"question\":\"Who has Java?\",\"maxResults\":30,\"minScore\":0.2}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.answer").value("Test answer."))
                 .andExpect(jsonPath("$.sources").isArray());

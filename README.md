@@ -48,6 +48,10 @@ Optional for all:
 - `RESUMES_PATH` – folder with PDF resumes (default: `./downloaded-resumes`)
 - `OPENROUTER_MODEL` – chat model (default: `openai/gpt-4o-mini`)
 - `OPENROUTER_EMBEDDING_MODEL` – embedding model (default: `openai/text-embedding-3-small`)
+- `RAG_MAX_RESULTS` – max retrieved chunks used for answer generation (default: `50`)
+- `RAG_MAX_ALLOWED_RESULTS` – hard upper bound accepted from per-query `maxResults` (default: `200`)
+- `RAG_MIN_SCORE` – minimum similarity score to keep a chunk as context (default: `0.0`)
+- `RAG_NO_RESULTS_ANSWER` – fallback answer when no chunks pass filtering (default: `I couldn't find relevant information in the ingested resumes.`)
 
 ---
 
@@ -125,10 +129,16 @@ Open **http://localhost:8084** in a browser. The left-hand menu has **Query** an
 ```bash
 curl -X POST http://localhost:8084/api/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "Who has experience with Java?"}'
+  -d '{"question": "Who has experience with Java?", "maxResults": 100, "minScore": 0.2}'
 ```
 
 Response shape: `{"answer": "...", "sources": [{"text": "...", "source": "filename.pdf"}, ...]}`.
+Each source includes a `score` field (similarity, higher is more relevant): `{"text":"...","source":"filename.pdf","score":0.87}`.
+The `answer` text is sectioned (`ANSWER`, `KEY_FINDINGS`, `LIMITATIONS`, `NEXT_STEPS`) so the UI can render it in a structured way.
+
+Notes:
+- `maxResults` and `minScore` are optional per-query overrides.
+- Returned sources are still similarity-ranked retrieval results (`top-k`), so "all qualifying" depends on the requested `maxResults` and the configured `RAG_MAX_ALLOWED_RESULTS`.
 
 **Option C – Swagger**
 

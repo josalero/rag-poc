@@ -28,6 +28,11 @@ langchain4j:
 app:
   store:
     type: ${RAG_STORE:memory}
+  rag:
+    max-results: ${RAG_MAX_RESULTS:50}
+    max-allowed-results: ${RAG_MAX_ALLOWED_RESULTS:200}
+    min-score: ${RAG_MIN_SCORE:0.0}
+    no-results-answer: ${RAG_NO_RESULTS_ANSWER:I couldn't find relevant information in the ingested resumes.}
   resumes:
     path: ${RESUMES_PATH:./downloaded-resumes}
   pgvector:
