@@ -1,0 +1,32 @@
+def feDir = file("${rootDir}/fe")
+def feDist = file("${feDir}/dist")
+def beStatic = file("${rootDir}/be/src/main/resources/static")
+
+tasks.register("npmInstallFe", Exec) {
+    workingDir feDir
+    commandLine "npm", "ci"
+    inputs.file("${feDir}/package.json")
+    inputs.file("${feDir}/package-lock.json")
+    outputs.dir("${feDir}/node_modules")
+}
+
+tasks.register("buildFe", Exec) {
+    dependsOn npmInstallFe
+    workingDir feDir
+    commandLine "npm", "run", "build"
+    inputs.dir("${feDir}/src")
+    inputs.file("${feDir}/vite.config.ts")
+    outputs.dir feDist
+}
+
+tasks.register("copyFeToBe", Copy) {
+    dependsOn buildFe
+    from feDist
+    into beStatic
+}
+
+project(":be") {
+    afterEvaluate {
+        tasks.named("processResources").configure { it.dependsOn(rootProject.tasks.named("copyFeToBe")) }
+    }
+}
