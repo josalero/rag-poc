@@ -9,6 +9,9 @@ export interface MetricsSummary {
   ingestRunCount: number
   ingestProcessed: number
   ingestSkipped: number
+  candidateExtractionLlmAttempts?: number
+  candidateExtractionLlmFailures?: number
+  candidateExtractionValidationWarnings?: number
 }
 
 async function parseError(res: Response): Promise<Error> {

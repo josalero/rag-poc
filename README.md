@@ -1,5 +1,7 @@
 # RAG POC – How to run
 
+Technical docs: see [docs/README.md](./docs/README.md)
+
 ## Store: in-memory (default) or PostgreSQL
 
 Set **`RAG_STORE`** to choose where embeddings are stored:
@@ -48,10 +50,17 @@ Optional for all:
 - `RESUMES_PATH` – folder with PDF resumes (default: `./downloaded-resumes`)
 - `OPENROUTER_MODEL` – chat model (default: `openai/gpt-4o-mini`)
 - `OPENROUTER_EMBEDDING_MODEL` – embedding model (default: `openai/text-embedding-3-small`)
+- `OPENROUTER_EMBEDDING_TIMEOUT_SECONDS` – embedding request timeout in seconds (default: `45`)
+- `OPENROUTER_EMBEDDING_MAX_RETRIES` – embedding request retries (default: `0`)
+- `OPENROUTER_EMBEDDING_MAX_SEGMENTS_PER_BATCH` – embedding batch size per request (default: `8`)
 - `RAG_MAX_RESULTS` – max retrieved chunks used for answer generation (default: `50`)
 - `RAG_MAX_ALLOWED_RESULTS` – hard upper bound accepted from per-query `maxResults` (default: `200`)
-- `RAG_MIN_SCORE` – minimum similarity score to keep a chunk as context (default: `0.0`)
+- `RAG_MIN_SCORE` – minimum similarity score to keep a chunk as context (default: `0.75`)
 - `RAG_NO_RESULTS_ANSWER` – fallback answer when no chunks pass filtering (default: `I couldn't find relevant information in the ingested resumes.`)
+- `INGEST_CONCURRENT_FILES` – max files ingested in parallel per folder run (default: `4`)
+- `INGEST_VIRTUAL_THREADS_ENABLED` – run ingestion workers on virtual threads (default: `true`)
+- `INGEST_LLM_ENRICHMENT_ENABLED` – enable hybrid LLM candidate enrichment during ingest (default: `true`)
+- `INGEST_LLM_ENRICHMENT_MAX_CHARS` – max normalized resume chars sent to enrichment model (default: `8000`)
 
 ---
 
@@ -106,6 +115,17 @@ The app listens on **http://localhost:8084**.
 
 **Web UI (recommended):** Open **http://localhost:8084**, go to the **Ingest** tab, and click **Run ingestion**. The UI streams progress and lists each file as it’s ingested or skipped. **Only `.pdf` files are accepted**; non-PDF files are skipped with a clear reason. The ingest flow also detects duplicate resume content (via hash) and merges duplicates into one candidate profile instead of indexing duplicate embeddings.
 
+During ingest, candidate extraction runs in **hybrid mode**:
+- Deterministic parsing for core fields (email, phone, links, skill signals, hashes).
+- Optional LLM enrichment for difficult fields (full name, summary, skill ranking, role hints).
+- Automatic fallback to deterministic extraction when enrichment fails/timeouts.
+- Versioned provenance saved per ingest (`extractionMethod`, `normalizedContentHash`, `fieldConfidence`, `fieldEvidence`, `validationWarnings`).
+
+Folder ingestion also supports **parallel virtual-thread execution** for faster throughput on network-bound embedding calls:
+- Worker count is controlled by `INGEST_CONCURRENT_FILES`.
+- Virtual threads can be toggled with `INGEST_VIRTUAL_THREADS_ENABLED`.
+- Duplicate content hashes are coordinated so only one same-content file is embedded at a time.
+
 **API (one-shot):**
 
 ```bash
@@ -158,6 +178,30 @@ Open **http://localhost:8084/swagger-ui.html**, find **POST /api/query**, click 
 - `GET /api/ingest/audit` – ingestion run history
 - `POST /api/query/feedback` – submit helpful/not-helpful feedback for an answer
 - `GET /api/query/feedback/stats` – feedback aggregate stats
+
+## Build pipeline behavior
+
+Frontend assets are built and copied into backend static resources as part of normal backend builds:
+
+- Root tasks:
+  - `npmInstallFe` – installs frontend dependencies.
+  - `buildFe` – builds `fe/dist`.
+  - `copyFeToBe` – copies `fe/dist` into `be/src/main/resources/static`.
+- `:be:processResources` depends on `copyFeToBe`, so `./gradlew :be:bootRun` and `./gradlew :be:build` include the FE dist automatically.
+
+## Refactoring steps for large classes
+
+When a class grows past ~400 lines, use this cleanup sequence:
+
+1. Identify responsibilities mixed in one file (parsing, scoring, transport, UI state, etc.).
+2. Extract pure logic first into utility classes (no Spring wiring), then inject/use them from the service/controller.
+3. Keep orchestration in the main service and move low-level parsing/normalization to helpers.
+4. Add regression tests before/after extraction to lock behavior.
+5. Re-run `./gradlew :be:test` and `npm --prefix fe run build` after each major extraction.
+
+Current extraction examples:
+- `CandidateNameExtractor` for name parsing/normalization heuristics.
+- `CandidateContactExtractor` for email/phone/url parsing and sanitization.
 
 ## Quick checklist
 

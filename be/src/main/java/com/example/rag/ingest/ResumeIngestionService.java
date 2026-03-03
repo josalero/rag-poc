@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -34,6 +35,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -53,12 +55,16 @@ public class ResumeIngestionService {
     private final CandidateProfileService candidateProfileService;
     private final IngestAuditService ingestAuditService;
     private final ObservabilityService observabilityService;
-    private final ExecutorService ingestExecutor = Executors.newFixedThreadPool(2);
+    private volatile ExecutorService embeddingExecutor;
 
     @Value("${app.resumes.path:./downloaded-resumes}")
     private String resumesPath;
     @Value("${app.ingest.file-timeout-seconds:60}")
     private int fileIngestTimeoutSeconds;
+    @Value("${app.ingest.concurrent-files:4}")
+    private int concurrentFiles;
+    @Value("${app.ingest.virtual-threads-enabled:true}")
+    private boolean virtualThreadsEnabled;
 
     public ResumeIngestionService(EmbeddingStore<TextSegment> embeddingStore,
                                   EmbeddingStoreIngestor embeddingStoreIngestor,
@@ -72,9 +78,17 @@ public class ResumeIngestionService {
         this.observabilityService = observabilityService;
     }
 
+    @PostConstruct
+    public void initializeExecutor() {
+        this.embeddingExecutor = newEmbeddingExecutor();
+    }
+
     @PreDestroy
     public void shutdownExecutor() {
-        ingestExecutor.shutdownNow();
+        ExecutorService executor = embeddingExecutor;
+        if (executor != null) {
+            executor.shutdownNow();
+        }
     }
 
     public record UploadResume(String filename, byte[] content) {}
@@ -116,35 +130,46 @@ public class ResumeIngestionService {
             skipped++;
             log.info("Skipped {} ({})", filename, reason);
             auditRun.addFileEvent(filename, "skipped", reason);
-            progress.accept(IngestProgressEvent.fileSkipped(filename, reason));
+            emitProgress(progress, IngestProgressEvent.fileSkipped(filename, reason));
         }
 
+        ConcurrentHashMap<String, CompletableFuture<Void>> contentHashGates = new ConcurrentHashMap<>();
         int processed = 0;
-        for (Path pdfPath : pdfs) {
-            String filename = pdfPath.getFileName().toString();
-            boolean ingested = false;
-            boolean readFailed = false;
-            try {
-                byte[] bytes = Files.readAllBytes(pdfPath);
-                ingested = processPdf(filename, bytes, pdfPath, auditRun, progress);
-            } catch (IOException e) {
-                readFailed = true;
-                skipped++;
-                log.warn("Skipped {}: {}", filename, e.getMessage());
-                auditRun.addFileEvent(filename, "skipped", e.getMessage());
-                progress.accept(IngestProgressEvent.fileSkipped(filename, e.getMessage()));
+        int effectiveParallelism = Math.max(1, concurrentFiles);
+        if (effectiveParallelism <= 1 || pdfs.size() <= 1) {
+            for (Path pdfPath : pdfs) {
+                FileIngestResult result = ingestFolderPdf(pdfPath, auditRun, progress, contentHashGates);
+                if (result.processed()) {
+                    processed++;
+                } else {
+                    skipped++;
+                }
             }
-            if (ingested) {
-                processed++;
-            } else if (!readFailed) {
-                skipped++;
+        } else {
+            ExecutorService fileExecutor = newFileExecutor(effectiveParallelism);
+            try {
+                List<CompletableFuture<FileIngestResult>> futures = pdfs.stream()
+                        .map(path -> CompletableFuture.supplyAsync(
+                                () -> ingestFolderPdf(path, auditRun, progress, contentHashGates),
+                                fileExecutor))
+                        .toList();
+                for (CompletableFuture<FileIngestResult> future : futures) {
+                    FileIngestResult result = future.join();
+                    if (result.processed()) {
+                        processed++;
+                    } else {
+                        skipped++;
+                    }
+                }
+            } finally {
+                fileExecutor.shutdownNow();
             }
         }
 
         log.info("Ingestion from folder completed. Processed: {}, skipped: {}", processed, skipped);
         ingestAuditService.saveRun(auditRun, processed, skipped);
         observabilityService.recordIngestRun(processed, skipped);
-        progress.accept(IngestProgressEvent.done(processed));
+        emitProgress(progress, IngestProgressEvent.done(processed));
         return processed;
     }
 
@@ -152,7 +177,7 @@ public class ResumeIngestionService {
         IngestAuditService.RunHandle auditRun = ingestAuditService.startRun();
         if (uploads == null || uploads.isEmpty()) {
             ingestAuditService.saveRun(auditRun, 0, 0);
-            progress.accept(IngestProgressEvent.done(0));
+            emitProgress(progress, IngestProgressEvent.done(0));
             return 0;
         }
 
@@ -167,7 +192,7 @@ public class ResumeIngestionService {
                 skipped++;
                 log.info("Skipped {} ({})", filename, reason);
                 auditRun.addFileEvent(filename, "skipped", reason);
-                progress.accept(IngestProgressEvent.fileSkipped(filename, reason));
+                emitProgress(progress, IngestProgressEvent.fileSkipped(filename, reason));
                 continue;
             }
 
@@ -177,7 +202,7 @@ public class ResumeIngestionService {
                 skipped++;
                 log.info("Skipped {} ({})", filename, reason);
                 auditRun.addFileEvent(filename, "skipped", reason);
-                progress.accept(IngestProgressEvent.fileSkipped(filename, reason));
+                emitProgress(progress, IngestProgressEvent.fileSkipped(filename, reason));
                 continue;
             }
 
@@ -187,7 +212,7 @@ public class ResumeIngestionService {
                 tempFile = Files.createTempFile("uploaded-resume-", suffix);
                 Files.write(tempFile, content);
 
-                boolean ingested = processPdf(filename, content, tempFile, auditRun, progress);
+                boolean ingested = processPdf(filename, content, tempFile, auditRun, progress, null);
                 if (ingested) {
                     processed++;
                 } else {
@@ -197,7 +222,7 @@ public class ResumeIngestionService {
                 skipped++;
                 log.warn("Skipped {}: {}", filename, e.getMessage());
                 auditRun.addFileEvent(filename, "skipped", e.getMessage());
-                progress.accept(IngestProgressEvent.fileSkipped(filename, e.getMessage()));
+                emitProgress(progress, IngestProgressEvent.fileSkipped(filename, e.getMessage()));
             } finally {
                 if (tempFile != null) {
                     try {
@@ -212,8 +237,26 @@ public class ResumeIngestionService {
         log.info("Uploaded ingestion completed. Processed: {}, skipped: {}", processed, skipped);
         ingestAuditService.saveRun(auditRun, processed, skipped);
         observabilityService.recordIngestRun(processed, skipped);
-        progress.accept(IngestProgressEvent.done(processed));
+        emitProgress(progress, IngestProgressEvent.done(processed));
         return processed;
+    }
+
+    private FileIngestResult ingestFolderPdf(
+            Path pdfPath,
+            IngestAuditService.RunHandle auditRun,
+            Consumer<IngestProgressEvent> progress,
+            Map<String, CompletableFuture<Void>> contentHashGates) {
+        String filename = pdfPath.getFileName().toString();
+        try {
+            byte[] bytes = Files.readAllBytes(pdfPath);
+            boolean ingested = processPdf(filename, bytes, pdfPath, auditRun, progress, contentHashGates);
+            return new FileIngestResult(ingested);
+        } catch (IOException e) {
+            log.warn("Skipped {}: {}", filename, e.getMessage());
+            auditRun.addFileEvent(filename, "skipped", e.getMessage());
+            emitProgress(progress, IngestProgressEvent.fileSkipped(filename, e.getMessage()));
+            return new FileIngestResult(false);
+        }
     }
 
     private boolean processPdf(
@@ -221,24 +264,43 @@ public class ResumeIngestionService {
             byte[] bytes,
             Path sourcePath,
             IngestAuditService.RunHandle auditRun,
-            Consumer<IngestProgressEvent> progress) {
+            Consumer<IngestProgressEvent> progress,
+            Map<String, CompletableFuture<Void>> contentHashGates) {
+        CompletableFuture<Void> ownedGate = null;
         try {
             String text = extractTextFromPdf(bytes);
             if (text == null) {
                 log.warn("Skipped {} (PDF parse failed)", filename);
                 auditRun.addFileEvent(filename, "skipped", "PDF parse failed");
-                progress.accept(IngestProgressEvent.fileSkipped(filename, "PDF parse failed"));
+                emitProgress(progress, IngestProgressEvent.fileSkipped(filename, "PDF parse failed"));
                 return false;
             }
             String sanitized = sanitizeText(text);
             String contentHash = contentHash(sanitized);
+
+            if (contentHashGates != null && !contentHash.isBlank()) {
+                ownedGate = acquireContentHashGate(contentHash, contentHashGates);
+                if (ownedGate == null) {
+                    java.util.Optional<String> duplicateOf = candidateProfileService.findDuplicateSource(filename, contentHash);
+                    if (duplicateOf.isPresent()) {
+                        String reason = "Duplicate resume content detected (same as " + duplicateOf.get() + "); merged under existing candidate";
+                        log.info("Skipped {} ({})", filename, reason);
+                        candidateProfileService.indexResume(filename, sourcePath, sanitized, contentHash);
+                        auditRun.addFileEvent(filename, "skipped", reason);
+                        emitProgress(progress, IngestProgressEvent.fileSkipped(filename, reason));
+                        return false;
+                    }
+                    ownedGate = acquireContentHashGate(contentHash, contentHashGates);
+                }
+            }
+
             java.util.Optional<String> duplicateOf = candidateProfileService.findDuplicateSource(filename, contentHash);
             if (duplicateOf.isPresent()) {
                 String reason = "Duplicate resume content detected (same as " + duplicateOf.get() + "); merged under existing candidate";
                 log.info("Skipped {} ({})", filename, reason);
                 candidateProfileService.indexResume(filename, sourcePath, sanitized, contentHash);
                 auditRun.addFileEvent(filename, "skipped", reason);
-                progress.accept(IngestProgressEvent.fileSkipped(filename, reason));
+                emitProgress(progress, IngestProgressEvent.fileSkipped(filename, reason));
                 return false;
             }
             // Remove any existing segments for this source so re-ingestion does not duplicate
@@ -252,19 +314,23 @@ public class ResumeIngestionService {
             candidateProfileService.indexResume(filename, sourcePath, sanitized, contentHash);
             log.info("Ingested: {}", filename);
             auditRun.addFileEvent(filename, "ingested", null);
-            progress.accept(IngestProgressEvent.fileIngested(filename));
+            emitProgress(progress, IngestProgressEvent.fileIngested(filename));
             return true;
         } catch (Exception e) {
             log.warn("Skipped {}: {}", filename, e.getMessage());
             auditRun.addFileEvent(filename, "skipped", e.getMessage());
-            progress.accept(IngestProgressEvent.fileSkipped(filename, e.getMessage()));
+            emitProgress(progress, IngestProgressEvent.fileSkipped(filename, e.getMessage()));
             return false;
+        } finally {
+            if (ownedGate != null) {
+                ownedGate.complete(null);
+            }
         }
     }
 
     private void ingestWithTimeout(Document doc) throws Exception {
         int timeoutSeconds = Math.max(1, fileIngestTimeoutSeconds);
-        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> embeddingStoreIngestor.ingest(doc), ingestExecutor);
+        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> embeddingStoreIngestor.ingest(doc), getOrCreateEmbeddingExecutor());
         try {
             future.get(timeoutSeconds, TimeUnit.SECONDS);
         } catch (TimeoutException timeout) {
@@ -279,6 +345,65 @@ public class ResumeIngestionService {
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Ingestion interrupted", interrupted);
+        }
+    }
+
+    private CompletableFuture<Void> acquireContentHashGate(
+            String contentHash,
+            Map<String, CompletableFuture<Void>> contentHashGates) {
+        if (contentHashGates == null || contentHash == null || contentHash.isBlank()) {
+            return null;
+        }
+        CompletableFuture<Void> newGate = new CompletableFuture<>();
+        CompletableFuture<Void> existing = contentHashGates.putIfAbsent(contentHash, newGate);
+        if (existing == null) {
+            return newGate;
+        }
+        int waitSeconds = Math.max(2, fileIngestTimeoutSeconds * 2);
+        try {
+            existing.get(waitSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            throw new RuntimeException("Timed out waiting for duplicate content gate", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting for duplicate content gate", e);
+        } catch (ExecutionException e) {
+            // Even when the first file failed, allow a retry path for this content hash.
+        }
+        return null;
+    }
+
+    private ExecutorService getOrCreateEmbeddingExecutor() {
+        ExecutorService executor = embeddingExecutor;
+        if (executor != null) {
+            return executor;
+        }
+        synchronized (this) {
+            if (embeddingExecutor == null) {
+                embeddingExecutor = newEmbeddingExecutor();
+            }
+            return embeddingExecutor;
+        }
+    }
+
+    private ExecutorService newEmbeddingExecutor() {
+        if (virtualThreadsEnabled) {
+            return Executors.newVirtualThreadPerTaskExecutor();
+        }
+        int poolSize = Math.max(2, concurrentFiles);
+        return Executors.newFixedThreadPool(poolSize);
+    }
+
+    private ExecutorService newFileExecutor(int parallelism) {
+        if (virtualThreadsEnabled) {
+            return Executors.newVirtualThreadPerTaskExecutor();
+        }
+        return Executors.newFixedThreadPool(Math.max(1, parallelism));
+    }
+
+    private static void emitProgress(Consumer<IngestProgressEvent> progress, IngestProgressEvent event) {
+        synchronized (progress) {
+            progress.accept(event);
         }
     }
 
@@ -310,6 +435,9 @@ public class ResumeIngestionService {
             return base + "-" + (seen + 1) + ext;
         }
         return candidate + "-" + (seen + 1);
+    }
+
+    private record FileIngestResult(boolean processed) {
     }
 
     /**

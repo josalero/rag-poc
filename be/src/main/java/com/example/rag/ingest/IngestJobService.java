@@ -2,6 +2,7 @@ package com.example.rag.ingest;
 
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.List;
@@ -9,12 +10,15 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Service
 public class IngestJobService {
 
     private final ResumeIngestionService resumeIngestionService;
     private final Map<String, MutableJob> jobs = new ConcurrentHashMap<>();
+    private final ExecutorService jobExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
     public IngestJobService(ResumeIngestionService resumeIngestionService) {
         this.resumeIngestionService = resumeIngestionService;
@@ -25,8 +29,13 @@ public class IngestJobService {
         MutableJob job = new MutableJob(id, "folder");
         jobs.put(id, job);
 
-        CompletableFuture.runAsync(() -> runFolderJob(job));
+        CompletableFuture.runAsync(() -> runFolderJob(job), jobExecutor);
         return job.toSnapshot();
+    }
+
+    @PreDestroy
+    public void shutdownExecutor() {
+        jobExecutor.shutdownNow();
     }
 
     public List<IngestJobStatus> listJobs(int limit) {

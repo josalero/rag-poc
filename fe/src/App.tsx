@@ -143,6 +143,11 @@ function formatDate(value?: string | null): string {
   return date.toLocaleString()
 }
 
+function formatPercent(value?: number): string {
+  if (value === undefined || value === null || Number.isNaN(value)) return '-'
+  return `${(value * 100).toFixed(0)}%`
+}
+
 function truncateText(text: string, maxChars: number): string {
   if (!text) return ''
   if (text.length <= maxChars) return text
@@ -260,9 +265,13 @@ function CandidateInfoCard({
     { key: 'Resume size', value: formatBytes(candidate.fileSizeBytes) },
     { key: 'Last ingested', value: formatDate(candidate.lastIngestedAt) },
   ]
+  const latestVersion = candidate.versions?.[0]
+  const confidenceEntries = Object.entries(latestVersion?.fieldConfidence ?? {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
 
   return (
-    <Card className={GLASS_CARD_CLASS} title={candidate.displayName} extra={<Tag color="green">{candidate.id}</Tag>}>
+    <Card className={GLASS_CARD_CLASS} title={candidate.displayName}>
       <Space direction="vertical" size="middle" className="w-full">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Space wrap>
@@ -363,6 +372,49 @@ function CandidateInfoCard({
               : candidate.suggestedRoles.slice(0, 3).map((role) => <Tag color="geekblue" key={role}>{role}</Tag>)}
           </div>
         </div>
+
+        <Card size="small" className="rounded-xl border border-slate-100 bg-slate-50">
+          <Space direction="vertical" size={6} className="w-full">
+            <Text strong>Extraction Quality</Text>
+            <Space wrap>
+              <Tag color={latestVersion?.extractionMethod === 'hybrid-llm-rules' ? 'success' : 'default'}>
+                Method: {latestVersion?.extractionMethod || 'rules-only'}
+              </Tag>
+              <Tag color="blue">Normalized chars: {latestVersion?.normalizedTextChars ?? 0}</Tag>
+              <Tag color="cyan">
+                Content hash: {latestVersion?.normalizedContentHash
+                  ? truncateText(latestVersion.normalizedContentHash, 18)
+                  : '-'}
+              </Tag>
+            </Space>
+
+            <div>
+              <Text strong>Top Field Confidence</Text>
+              <div className="mt-1 flex flex-wrap gap-2">
+                {confidenceEntries.length === 0
+                  ? <Text type="secondary">No confidence scores available</Text>
+                  : confidenceEntries.map(([field, value]) => (
+                    <Tag key={field} color="processing">{field}: {formatPercent(value)}</Tag>
+                  ))}
+              </div>
+            </div>
+
+            <div>
+              <Text strong>Validation Warnings</Text>
+              <div className="mt-1">
+                {(latestVersion?.validationWarnings?.length ?? 0) === 0
+                  ? <Text type="secondary">No validation warnings</Text>
+                  : (
+                    <List
+                      size="small"
+                      dataSource={latestVersion?.validationWarnings ?? []}
+                      renderItem={(warning, index) => <List.Item key={`warning-${index}`}>{warning}</List.Item>}
+                    />
+                  )}
+              </div>
+            </div>
+          </Space>
+        </Card>
 
         <Card size="small" className="rounded-xl border border-slate-100 bg-slate-50">
           <Text strong>Version History</Text>
@@ -577,7 +629,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
         render: (candidateId: string) => (
           candidateId ? (
             <Button size="small" type="link" icon={<UserOutlined />} onClick={() => onOpenCandidate(candidateId)}>
-              {truncateText(candidateNameById[candidateId] ?? candidateId, isMobile ? 24 : 32)}
+              {truncateText(candidateNameById[candidateId] ?? 'Candidate Profile', isMobile ? 24 : 32)}
             </Button>
           ) : (
             <Text type="secondary">-</Text>
@@ -994,23 +1046,9 @@ function CandidatesTab({
   }
 
   useEffect(() => {
-    void loadCandidates()
-  }, [page, pageSize, sort])
-
-  useEffect(() => {
     if (!isActive) return
     void loadCandidates()
-  }, [isActive])
-
-  useEffect(() => {
-    if (!isActive) return
-    const interval = window.setInterval(() => {
-      void loadCandidates()
-    }, 5000)
-    return () => {
-      window.clearInterval(interval)
-    }
-  }, [isActive, page, pageSize, sort, search, skill])
+  }, [isActive, page, pageSize, sort])
 
   useEffect(() => {
     if (!selectedCandidateId) return
@@ -1058,12 +1096,7 @@ function CandidatesTab({
         key: 'displayName',
         width: isMobile ? 180 : 220,
         render: (_, candidate) => (
-          <Space direction="vertical" size={0}>
-            <Text strong>{candidate.displayName}</Text>
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              {truncateText(candidate.id, 32)}
-            </Text>
-          </Space>
+          <Text strong>{candidate.displayName}</Text>
         ),
       },
       {
@@ -1171,7 +1204,7 @@ function CandidatesTab({
       <Card
         className={GLASS_CARD_CLASS}
         title={`Candidates (${total})`}
-        extra={<Text type="secondary">Open a candidate profile from Actions · Auto-refresh: 5s</Text>}
+        extra={<Text type="secondary">Open a candidate profile from Actions</Text>}
         loading={loading}
       >
         <Table<CandidateProfile>
@@ -1267,7 +1300,7 @@ function CompareTab() {
               className="mt-2 w-full"
               allowClear
               value={candidateAId}
-              options={options.map((candidate) => ({ label: `${candidate.displayName} (${candidate.id})`, value: candidate.id }))}
+              options={options.map((candidate) => ({ label: candidate.displayName, value: candidate.id }))}
               onChange={(value) => setCandidateAId(value)}
             />
           </Col>
@@ -1277,7 +1310,7 @@ function CompareTab() {
               className="mt-2 w-full"
               allowClear
               value={candidateBId}
-              options={options.map((candidate) => ({ label: `${candidate.displayName} (${candidate.id})`, value: candidate.id }))}
+              options={options.map((candidate) => ({ label: candidate.displayName, value: candidate.id }))}
               onChange={(value) => setCandidateBId(value)}
             />
           </Col>
@@ -1864,12 +1897,25 @@ function AuditTab() {
     <Space direction="vertical" size="middle" className="w-full">
       <Card className={GLASS_CARD_CLASS} title="Ingestion Audit" extra={<Button icon={<ReloadOutlined />} onClick={() => void loadAudit()}>Refresh</Button>}>
         {metrics && (
-          <Row gutter={[12, 12]} className="mb-4">
-            <Col xs={12} md={6}><Statistic title="Queries" value={metrics.queryCount} /></Col>
-            <Col xs={12} md={6}><Statistic title="Query Errors" value={metrics.queryErrors} /></Col>
-            <Col xs={12} md={6}><Statistic title="Avg Query Latency (ms)" value={metrics.avgQueryLatencyMs.toFixed(1)} /></Col>
-            <Col xs={12} md={6}><Statistic title="Ingest Runs" value={metrics.ingestRunCount} /></Col>
-          </Row>
+          <Space direction="vertical" size="small" className="mb-4 w-full">
+            <Row gutter={[12, 12]}>
+              <Col xs={12} md={6}><Statistic title="Queries" value={metrics.queryCount} /></Col>
+              <Col xs={12} md={6}><Statistic title="Query Errors" value={metrics.queryErrors} /></Col>
+              <Col xs={12} md={6}><Statistic title="Avg Query Latency (ms)" value={metrics.avgQueryLatencyMs.toFixed(1)} /></Col>
+              <Col xs={12} md={6}><Statistic title="Ingest Runs" value={metrics.ingestRunCount} /></Col>
+            </Row>
+            <Row gutter={[12, 12]}>
+              <Col xs={12} md={8}>
+                <Statistic title="LLM Extractions" value={metrics.candidateExtractionLlmAttempts ?? 0} />
+              </Col>
+              <Col xs={12} md={8}>
+                <Statistic title="LLM Fallbacks" value={metrics.candidateExtractionLlmFailures ?? 0} />
+              </Col>
+              <Col xs={24} md={8}>
+                <Statistic title="Validation Warnings" value={metrics.candidateExtractionValidationWarnings ?? 0} />
+              </Col>
+            </Row>
+          </Space>
         )}
         {error && <Alert type="error" showIcon message={error} className="mb-3" />}
         {runs.length === 0 ? (

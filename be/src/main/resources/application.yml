@@ -23,7 +23,7 @@ langchain4j:
     chat-model:
       base-url: https://openrouter.ai/api/v1
       api-key: ${OPENROUTER_API_KEY}
-      model-name: ${OPENROUTER_MODEL:openai/gpt-4o-mini}
+      model-name: ${OPENROUTER_MODEL:deepseek/deepseek-v3.2}
     embedding-model:
       base-url: ${OPENROUTER_EMBEDDING_BASE_URL:https://openrouter.ai/api/v1}
       api-key: ${OPENROUTER_API_KEY}
@@ -44,6 +44,11 @@ app:
     path: ${RESUMES_PATH:./downloaded-resumes}
   ingest:
     file-timeout-seconds: ${INGEST_FILE_TIMEOUT_SECONDS:60}
+    concurrent-files: ${INGEST_CONCURRENT_FILES:4}
+    virtual-threads-enabled: ${INGEST_VIRTUAL_THREADS_ENABLED:true}
+    llm-enrichment:
+      enabled: ${INGEST_LLM_ENRICHMENT_ENABLED:true}
+      max-chars: ${INGEST_LLM_ENRICHMENT_MAX_CHARS:8000}
   pgvector:
     table: document_embeddings
   cors:

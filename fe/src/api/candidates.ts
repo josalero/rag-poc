@@ -9,6 +9,12 @@ export interface CandidateProfileVersion {
   estimatedYearsExperience: number | null
   location: string
   preview: string
+  extractionMethod?: string
+  normalizedContentHash?: string
+  normalizedTextChars?: number
+  fieldConfidence?: Record<string, number>
+  fieldEvidence?: Record<string, string>
+  validationWarnings?: string[]
 }
 
 export interface CandidateProfile {

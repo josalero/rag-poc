@@ -61,7 +61,7 @@ public class IngestAuditService {
             this.startedAt = startedAt;
         }
 
-        public void addFileEvent(String filename, String status, String reason) {
+        public synchronized void addFileEvent(String filename, String status, String reason) {
             files.add(new IngestAuditFileEntry(filename, status, reason, Instant.now()));
         }
     }

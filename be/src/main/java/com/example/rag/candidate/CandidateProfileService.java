@@ -1,5 +1,7 @@
 package com.example.rag.candidate;
 
+import com.example.rag.metrics.ObservabilityService;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -33,27 +35,6 @@ public class CandidateProfileService {
             "qa", "testing", "selenium", "cypress", "playwright", "postman",
             "cucumber", "testng", "junit", "jenkins", "ansible", "linux",
             "bash", "prometheus", "grafana", "sre"
-    );
-
-    private static final Set<String> NAME_BLOCKLIST = Set.of(
-            "summary", "experience", "education", "skills", "projects", "profile", "contact",
-            "objective", "certifications", "resume", "curriculum", "vitae", "linkedin", "github"
-    );
-
-    private static final Set<String> NAME_ROLE_NOISE = Set.of(
-            "engineer", "developer", "architect", "manager", "consultant", "intern", "software",
-            "qa", "sdet", "tester", "devops", "platform", "cloud", "frontend", "backend",
-            "full", "stack", "senior", "junior", "principal", "lead"
-    );
-
-    private static final Set<String> LOCATION_HINT_WORDS = Set.of(
-            "remote", "hybrid", "onsite", "on", "site", "united", "states", "usa", "canada",
-            "mexico", "costa", "rica", "spain", "germany", "france", "italy", "uk", "england",
-            "brazil", "argentina", "colombia", "peru", "chile"
-    );
-
-    private static final Set<String> NAME_PARTICLES = Set.of(
-            "de", "del", "la", "las", "los", "da", "dos", "do", "van", "von", "y"
     );
 
     private static final Set<String> US_STATE_CODES = Set.of(
@@ -172,21 +153,21 @@ public class CandidateProfileService {
     private static final Pattern YEARS_PATTERN = Pattern.compile("(\\d{1,2})\\+?\\s+years", Pattern.CASE_INSENSITIVE);
     private static final Pattern LOCATION_PATTERN = Pattern.compile("(?:location|based in)\\s*[:\\-]\\s*([^\\n,;]+(?:,\\s*[^\\n,;]+)?)", Pattern.CASE_INSENSITIVE);
     private static final Pattern CITY_STATE_PATTERN = Pattern.compile("([A-Z][a-z]+(?:[\\s\\-'][A-Z][a-z]+)*,\\s*([A-Z]{2}))");
-    private static final Pattern NAME_TOKEN_PATTERN = Pattern.compile("^[\\p{L}][\\p{L}.\\-']*$");
-    private static final Pattern NAME_SEGMENT_SPLIT_PATTERN = Pattern.compile("\\s(?:\\||•|·|—|–|:)\\s|\\s+-\\s");
-    private static final Pattern NAME_WITH_ROLE_SUFFIX_PATTERN = Pattern.compile(
-            "^([\\p{L}][\\p{L}.\\-']*(?:\\s+[\\p{L}][\\p{L}.\\-']*){1,3})\\s+"
-                    + "(?:senior|junior|principal|lead|staff|software|qa|sdet|devops|backend|frontend|full[- ]?stack|"
-                    + "engineering|engineer|developer|manager|architect)\\b.*$",
-            Pattern.CASE_INSENSITIVE);
-    private static final Pattern EMAIL_PATTERN = Pattern.compile("([A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})", Pattern.CASE_INSENSITIVE);
-    private static final Pattern PHONE_PATTERN = Pattern.compile("(\\+?\\d[\\d\\s().\\-]{7,}\\d)");
-    private static final Pattern URL_PATTERN = Pattern.compile("((?:https?://)?(?:www\\.)?(?:linkedin\\.com|github\\.com)/[^\\s)]+)", Pattern.CASE_INSENSITIVE);
-    private static final Pattern WEB_URL_PATTERN = Pattern.compile("((?:https?://)?(?:www\\.)?[a-z0-9][a-z0-9.-]+\\.[a-z]{2,}(?:/[^\\s)]*)?)", Pattern.CASE_INSENSITIVE);
-
     private final Map<String, CandidateProfile> candidatesById = new ConcurrentHashMap<>();
     private final Map<String, String> candidateIdBySourceFilename = new ConcurrentHashMap<>();
     private final Map<String, String> candidateIdByContentHash = new ConcurrentHashMap<>();
+    private ResumeLlmEnrichmentService llmEnrichmentService;
+    private ObservabilityService observabilityService;
+
+    @Autowired(required = false)
+    void setLlmEnrichmentService(ResumeLlmEnrichmentService llmEnrichmentService) {
+        this.llmEnrichmentService = llmEnrichmentService;
+    }
+
+    @Autowired(required = false)
+    void setObservabilityService(ObservabilityService observabilityService) {
+        this.observabilityService = observabilityService;
+    }
 
     public void indexResume(String sourceFilename, Path resumePath, String text) {
         indexResume(sourceFilename, resumePath, text, computeContentHash(text));
@@ -194,18 +175,71 @@ public class CandidateProfileService {
 
     public void indexResume(String sourceFilename, Path resumePath, String text, String contentHash) {
         String normalizedText = text == null ? "" : text.replace("\r", "\n");
-        String displayName = extractDisplayName(sourceFilename, normalizedText);
-        String email = extractEmail(normalizedText);
-        String phone = extractPhone(normalizedText);
-        String linkedinUrl = extractLinkedinUrl(normalizedText);
-        String githubUrl = extractGithubUrl(normalizedText);
-        String portfolioUrl = extractPortfolioUrl(normalizedText);
+        String normalizedContentHash = contentHash != null && !contentHash.isBlank()
+                ? contentHash
+                : computeContentHash(normalizedText);
+
+        String displayName = CandidateNameExtractor.extractDisplayName(sourceFilename, normalizedText);
+        String email = CandidateContactExtractor.extractEmail(normalizedText);
+        String phone = CandidateContactExtractor.extractPhone(normalizedText);
+        String linkedinUrl = CandidateContactExtractor.extractLinkedinUrl(normalizedText);
+        String githubUrl = CandidateContactExtractor.extractGithubUrl(normalizedText);
+        String portfolioUrl = CandidateContactExtractor.extractPortfolioUrl(normalizedText);
         SkillExtraction skillExtraction = extractSkillExtraction(normalizedText);
         List<String> skills = skillExtraction.skills();
         List<String> significantSkills = skillExtraction.significantSkills();
         Integer years = extractYearsExperience(normalizedText);
         String location = extractLocation(normalizedText);
         List<String> suggestedRoles = suggestRoles(normalizedText, skills, years);
+        List<String> validationWarnings = new ArrayList<>();
+        Map<String, Double> fieldConfidence = new LinkedHashMap<>();
+        Map<String, String> fieldEvidence = new LinkedHashMap<>();
+        String llmSummary = "";
+        String extractionMethod = "rules-only";
+        boolean llmAttempted = false;
+        boolean llmFailed = false;
+
+        if (llmEnrichmentService != null && llmEnrichmentService.isEnabled()) {
+            llmAttempted = true;
+            Optional<ResumeLlmEnrichmentService.LlmProfileEnrichment> llmEnrichment = llmEnrichmentService.enrich(normalizedText);
+            if (llmEnrichment.isPresent()) {
+                ResumeLlmEnrichmentService.LlmProfileEnrichment llm = llmEnrichment.get();
+                if (shouldPreferLlmDisplayName(displayName, sourceFilename) && isPlausibleDisplayName(llm.displayName())) {
+                    displayName = llm.displayName();
+                }
+                skills = mergeRanked(skills, llm.skills(), 20);
+                significantSkills = mergeRanked(llm.significantSkills(), significantSkills, SIGNIFICANT_SKILLS_LIMIT);
+                suggestedRoles = mergeRanked(llm.suggestedRoles(), suggestedRoles, SUGGESTED_ROLES_LIMIT);
+                years = chooseYearsValue(years, llm.estimatedYearsExperience(), llm.fieldConfidence().get("estimatedYearsExperience"));
+                if ((location == null || location.isBlank()) && llm.location() != null && isLikelyLocation(llm.location())) {
+                    location = llm.location();
+                }
+                llmSummary = llm.summary() != null ? llm.summary() : "";
+                fieldConfidence.putAll(llm.fieldConfidence());
+                fieldEvidence.putAll(llm.fieldEvidence());
+                extractionMethod = "hybrid-llm-rules";
+            } else {
+                llmFailed = true;
+                extractionMethod = "rules-fallback";
+                validationWarnings.add("LLM enrichment unavailable or invalid output; deterministic extraction applied.");
+            }
+        }
+
+        addDeterministicEvidenceAndConfidence(
+                fieldConfidence,
+                fieldEvidence,
+                displayName,
+                email,
+                phone,
+                linkedinUrl,
+                githubUrl,
+                portfolioUrl,
+                years,
+                location,
+                suggestedRoles
+        );
+        addValidationWarnings(validationWarnings, displayName, email, phone, skills, significantSkills, suggestedRoles);
+
         String preview = buildPreview(
                 normalizedText,
                 displayName,
@@ -218,7 +252,8 @@ public class CandidateProfileService {
                 phone,
                 linkedinUrl,
                 githubUrl,
-                portfolioUrl);
+                portfolioUrl,
+                llmSummary);
 
         long fileSize = 0L;
         Instant modifiedAt = null;
@@ -250,12 +285,21 @@ public class CandidateProfileService {
                 location,
                 fileSize,
                 modifiedAt,
-                preview);
+                preview,
+                extractionMethod,
+                normalizedContentHash,
+                normalizedText.length(),
+                fieldConfidence,
+                fieldEvidence,
+                validationWarnings);
 
         candidatesById.put(candidateId, merged);
         candidateIdBySourceFilename.put(sourceFilename, candidateId);
-        if (contentHash != null && !contentHash.isBlank()) {
-            candidateIdByContentHash.putIfAbsent(contentHash, candidateId);
+        if (!normalizedContentHash.isBlank()) {
+            candidateIdByContentHash.putIfAbsent(normalizedContentHash, candidateId);
+        }
+        if (observabilityService != null) {
+            observabilityService.recordCandidateExtraction(llmAttempted, llmFailed, validationWarnings.size());
         }
     }
 
@@ -352,7 +396,13 @@ public class CandidateProfileService {
             String location,
             long fileSize,
             Instant modifiedAt,
-            String preview) {
+            String preview,
+            String extractionMethod,
+            String normalizedContentHash,
+            int normalizedTextChars,
+            Map<String, Double> fieldConfidence,
+            Map<String, String> fieldEvidence,
+            List<String> validationWarnings) {
         Instant now = Instant.now();
         if (existing == null) {
             return new CandidateProfile(
@@ -382,7 +432,13 @@ public class CandidateProfileService {
                             suggestedRoles,
                             years,
                             location,
-                            preview))
+                            preview,
+                            extractionMethod,
+                            normalizedContentHash,
+                            normalizedTextChars,
+                            fieldConfidence,
+                            fieldEvidence,
+                            validationWarnings))
             );
         }
 
@@ -401,7 +457,13 @@ public class CandidateProfileService {
                 suggestedRoles,
                 years,
                 location,
-                preview));
+                preview,
+                extractionMethod,
+                normalizedContentHash,
+                normalizedTextChars,
+                fieldConfidence,
+                fieldEvidence,
+                validationWarnings));
         versions.addAll(existing.versions() != null ? existing.versions() : List.of());
         if (versions.size() > VERSION_HISTORY_LIMIT) {
             versions = versions.subList(0, VERSION_HISTORY_LIMIT);
@@ -438,7 +500,13 @@ public class CandidateProfileService {
             List<String> suggestedRoles,
             Integer years,
             String location,
-            String preview) {
+            String preview,
+            String extractionMethod,
+            String normalizedContentHash,
+            int normalizedTextChars,
+            Map<String, Double> fieldConfidence,
+            Map<String, String> fieldEvidence,
+            List<String> validationWarnings) {
         return new CandidateProfileVersion(
                 sourceFilename,
                 ingestedAt,
@@ -447,7 +515,13 @@ public class CandidateProfileService {
                 suggestedRoles != null ? List.copyOf(suggestedRoles) : List.of(),
                 years,
                 location != null ? location : "",
-                preview != null ? preview : ""
+                preview != null ? preview : "",
+                extractionMethod != null ? extractionMethod : "rules-only",
+                normalizedContentHash != null ? normalizedContentHash : "",
+                Math.max(0, normalizedTextChars),
+                fieldConfidence != null ? Map.copyOf(fieldConfidence) : Map.of(),
+                fieldEvidence != null ? Map.copyOf(fieldEvidence) : Map.of(),
+                validationWarnings != null ? List.copyOf(validationWarnings) : List.of()
         );
     }
 
@@ -493,6 +567,124 @@ public class CandidateProfileService {
             return a;
         }
         return b.isAfter(a) ? b : a;
+    }
+
+    private static boolean shouldPreferLlmDisplayName(String currentDisplayName, String sourceFilename) {
+        if (currentDisplayName == null || currentDisplayName.isBlank() || "Candidate".equalsIgnoreCase(currentDisplayName)) {
+            return true;
+        }
+        String fromFilename = CandidateNameExtractor.nameFromFilename(sourceFilename);
+        if (fromFilename.equalsIgnoreCase(currentDisplayName)) {
+            return true;
+        }
+        String normalized = currentDisplayName.toLowerCase(Locale.ROOT);
+        boolean emailLikeOrUsernameLike = normalized.contains("gmail")
+                || normalized.contains("yahoo")
+                || normalized.contains("hotmail")
+                || normalized.contains("outlook");
+        if (emailLikeOrUsernameLike) {
+            return true;
+        }
+        return CandidateNameExtractor.looksLikeSkillOrRolePhrase(currentDisplayName, KNOWN_SKILLS);
+    }
+
+    private static boolean isPlausibleDisplayName(String value) {
+        return CandidateNameExtractor.isPlausibleDisplayName(value);
+    }
+
+    private static Integer chooseYearsValue(Integer deterministicYears, Integer llmYears, Double llmConfidence) {
+        if (llmYears == null || llmYears < 0 || llmYears > 60) {
+            return deterministicYears;
+        }
+        if (deterministicYears == null || deterministicYears <= 0) {
+            return llmYears;
+        }
+        double confidence = llmConfidence != null ? llmConfidence : 0.0d;
+        if (Math.abs(deterministicYears - llmYears) <= 2 && confidence >= 0.8d) {
+            return Math.max(deterministicYears, llmYears);
+        }
+        return deterministicYears;
+    }
+
+    private static void addDeterministicEvidenceAndConfidence(
+            Map<String, Double> fieldConfidence,
+            Map<String, String> fieldEvidence,
+            String displayName,
+            String email,
+            String phone,
+            String linkedinUrl,
+            String githubUrl,
+            String portfolioUrl,
+            Integer years,
+            String location,
+            List<String> suggestedRoles) {
+        if (fieldConfidence == null || fieldEvidence == null) {
+            return;
+        }
+        if (displayName != null && !displayName.isBlank()) {
+            fieldConfidence.putIfAbsent("displayName", 0.92d);
+            fieldEvidence.putIfAbsent("displayName", truncate(displayName, 120));
+        }
+        if (email != null && !email.isBlank()) {
+            fieldConfidence.putIfAbsent("email", 0.99d);
+            fieldEvidence.putIfAbsent("email", email);
+        }
+        if (phone != null && !phone.isBlank()) {
+            fieldConfidence.putIfAbsent("phone", 0.96d);
+            fieldEvidence.putIfAbsent("phone", phone);
+        }
+        if (linkedinUrl != null && !linkedinUrl.isBlank()) {
+            fieldConfidence.putIfAbsent("linkedinUrl", 0.99d);
+            fieldEvidence.putIfAbsent("linkedinUrl", truncate(linkedinUrl, 120));
+        }
+        if (githubUrl != null && !githubUrl.isBlank()) {
+            fieldConfidence.putIfAbsent("githubUrl", 0.99d);
+            fieldEvidence.putIfAbsent("githubUrl", truncate(githubUrl, 120));
+        }
+        if (portfolioUrl != null && !portfolioUrl.isBlank()) {
+            fieldConfidence.putIfAbsent("portfolioUrl", 0.98d);
+            fieldEvidence.putIfAbsent("portfolioUrl", truncate(portfolioUrl, 120));
+        }
+        if (years != null && years > 0) {
+            fieldConfidence.putIfAbsent("estimatedYearsExperience", 0.86d);
+            fieldEvidence.putIfAbsent("estimatedYearsExperience", years + " years");
+        }
+        if (location != null && !location.isBlank()) {
+            fieldConfidence.putIfAbsent("location", 0.80d);
+            fieldEvidence.putIfAbsent("location", truncate(location, 120));
+        }
+        if (suggestedRoles != null && !suggestedRoles.isEmpty()) {
+            fieldConfidence.putIfAbsent("suggestedRoles", 0.82d);
+            fieldEvidence.putIfAbsent("suggestedRoles", String.join(", ", suggestedRoles.stream().limit(3).toList()));
+        }
+    }
+
+    private static void addValidationWarnings(
+            List<String> warnings,
+            String displayName,
+            String email,
+            String phone,
+            List<String> skills,
+            List<String> significantSkills,
+            List<String> suggestedRoles) {
+        if (warnings == null) {
+            return;
+        }
+        if (displayName == null || displayName.isBlank() || "Candidate".equalsIgnoreCase(displayName)) {
+            warnings.add("Candidate name confidence is low; verify the extracted full name.");
+        }
+        if ((email == null || email.isBlank()) && (phone == null || phone.isBlank())) {
+            warnings.add("No direct contact channel detected (email/phone missing).");
+        }
+        if (skills == null || skills.isEmpty()) {
+            warnings.add("No known skills were extracted from this resume.");
+        }
+        if (significantSkills == null || significantSkills.isEmpty()) {
+            warnings.add("No significant skills were ranked for this resume.");
+        }
+        if (suggestedRoles == null || suggestedRoles.isEmpty()) {
+            warnings.add("No role alignment could be inferred from extracted content.");
+        }
     }
 
     private static String resolveCandidateId(
@@ -552,287 +744,6 @@ public class CandidateProfileService {
             case "name_desc" -> Comparator.comparing(CandidateProfile::displayName, String.CASE_INSENSITIVE_ORDER).reversed();
             default -> Comparator.comparing(CandidateProfile::displayName, String.CASE_INSENSITIVE_ORDER);
         };
-    }
-
-    private static String extractDisplayName(String filename, String text) {
-        List<String> candidateLines = Arrays.stream(text.split("\\n"))
-                .map(String::trim)
-                .filter(line -> !line.isBlank())
-                .limit(20)
-                .toList();
-
-        String bestName = "";
-        double bestScore = Double.NEGATIVE_INFINITY;
-        for (int i = 0; i < candidateLines.size(); i++) {
-            for (String lineVariant : expandCandidateLineVariants(candidateLines.get(i))) {
-                String candidate = normalizeCandidateName(lineVariant);
-                if (candidate.isBlank()) {
-                    continue;
-                }
-                double score = scoreNameCandidate(candidate, i);
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestName = candidate;
-                }
-            }
-        }
-
-        if (!bestName.isBlank()) {
-            return bestName;
-        }
-
-        String fromEmail = nameFromEmail(text);
-        if (!fromEmail.isBlank()) {
-            return fromEmail;
-        }
-
-        return nameFromFilename(filename);
-    }
-
-    private static List<String> expandCandidateLineVariants(String line) {
-        if (line == null || line.isBlank()) {
-            return List.of();
-        }
-        String trimmed = line.trim();
-        LinkedHashSet<String> variants = new LinkedHashSet<>();
-        variants.add(trimmed);
-
-        String lower = trimmed.toLowerCase(Locale.ROOT);
-        if (lower.startsWith("name:")) {
-            variants.add(trimmed.substring(5).trim());
-        } else if (lower.startsWith("name -")) {
-            variants.add(trimmed.substring(6).trim());
-        }
-
-        for (String segment : NAME_SEGMENT_SPLIT_PATTERN.split(trimmed)) {
-            String compact = segment.trim();
-            if (!compact.isBlank()) {
-                variants.add(compact);
-            }
-        }
-        return variants.stream().toList();
-    }
-
-    private static String normalizeCandidateName(String line) {
-        if (line == null) {
-            return "";
-        }
-        String compact = line.replaceAll("\\s+", " ").trim();
-        if (compact.isBlank() || compact.length() > 80) {
-            return "";
-        }
-        compact = stripRoleSuffixFromNameLine(compact);
-        if (compact.contains("@") || compact.matches(".*\\d.*") || compact.toLowerCase(Locale.ROOT).contains("http")) {
-            return "";
-        }
-        if (looksLikeLocationPhrase(compact)) {
-            return "";
-        }
-
-        List<String> lineWords = Arrays.stream(compact.toLowerCase(Locale.ROOT).split("[^\\p{L}]+"))
-                .filter(word -> !word.isBlank())
-                .toList();
-        if (lineWords.stream().anyMatch(NAME_BLOCKLIST::contains)) {
-            return "";
-        }
-        if (lineWords.stream().anyMatch(NAME_ROLE_NOISE::contains)) {
-            return "";
-        }
-
-        List<String> rawTokens = Arrays.stream(compact.replace(',', ' ').replace(';', ' ').split("\\s+"))
-                .filter(token -> !token.isBlank())
-                .toList();
-        List<String> normalizedRawTokens = collapseSingleLetterRuns(rawTokens);
-        String[] normalizedTokensArray = normalizedRawTokens.toArray(new String[0]);
-        if (normalizedTokensArray.length < 2 || normalizedTokensArray.length > 6) {
-            return "";
-        }
-
-        List<String> normalizedTokens = new ArrayList<>();
-        for (int i = 0; i < normalizedTokensArray.length; i++) {
-            String token = normalizedTokensArray[i].replaceAll("^[^\\p{L}]+|[^\\p{L}.\\-']+$", "");
-            if (token.isBlank() || !NAME_TOKEN_PATTERN.matcher(token).matches()) {
-                return "";
-            }
-            String lower = token.toLowerCase(Locale.ROOT);
-            if (i > 0 && NAME_PARTICLES.contains(lower)) {
-                normalizedTokens.add(lower);
-            } else {
-                normalizedTokens.add(titleCaseToken(lower));
-            }
-        }
-
-        return String.join(" ", normalizedTokens).trim();
-    }
-
-    private static String stripRoleSuffixFromNameLine(String line) {
-        if (line == null || line.isBlank()) {
-            return "";
-        }
-        Matcher matcher = NAME_WITH_ROLE_SUFFIX_PATTERN.matcher(line.trim());
-        if (!matcher.matches()) {
-            return line.trim();
-        }
-        return matcher.group(1).trim();
-    }
-
-    private static List<String> collapseSingleLetterRuns(List<String> tokens) {
-        List<String> collapsed = new ArrayList<>();
-        StringBuilder letterRun = new StringBuilder();
-        for (String rawToken : tokens) {
-            String token = rawToken.replaceAll("^[^\\p{L}]+|[^\\p{L}.\\-']+$", "");
-            if (token.length() == 1 && Character.isLetter(token.charAt(0))) {
-                letterRun.append(token);
-                continue;
-            }
-            flushLetterRun(collapsed, letterRun);
-            if (!token.isBlank()) {
-                collapsed.add(token);
-            }
-        }
-        flushLetterRun(collapsed, letterRun);
-        return collapsed;
-    }
-
-    private static void flushLetterRun(List<String> target, StringBuilder letterRun) {
-        if (letterRun.length() >= 2) {
-            target.add(letterRun.toString());
-        } else if (letterRun.length() == 1) {
-            target.add(letterRun.toString() + ".");
-        }
-        letterRun.setLength(0);
-    }
-
-    private static double scoreNameCandidate(String name, int lineIndex) {
-        String[] tokens = name.split("\\s+");
-        int tokenCount = tokens.length;
-        double score = 100.0 - (lineIndex * 4.0);
-        if (tokenCount == 2 || tokenCount == 3) {
-            score += 8.0;
-        } else if (tokenCount == 4) {
-            score += 4.0;
-        }
-        long particleCount = Arrays.stream(tokens)
-                .map(token -> token.toLowerCase(Locale.ROOT))
-                .filter(NAME_PARTICLES::contains)
-                .count();
-        score += Math.min(2.0, particleCount);
-        if (looksLikeLocationPhrase(name)) {
-            score -= 20.0;
-        }
-        return score;
-    }
-
-    private static String titleCaseToken(String token) {
-        String lower = token.toLowerCase(Locale.ROOT);
-        StringBuilder sb = new StringBuilder(lower.length());
-        boolean capitalizeNext = true;
-        for (int i = 0; i < lower.length(); i++) {
-            char ch = lower.charAt(i);
-            if (ch == '-' || ch == '\'' || ch == '.') {
-                sb.append(ch);
-                capitalizeNext = true;
-                continue;
-            }
-            if (capitalizeNext && Character.isLetter(ch)) {
-                sb.append(Character.toUpperCase(ch));
-                capitalizeNext = false;
-            } else {
-                sb.append(ch);
-                capitalizeNext = false;
-            }
-        }
-        return sb.toString();
-    }
-
-    private static String nameFromFilename(String filename) {
-        String base = filename == null ? "Candidate" : filename;
-        int extensionIndex = base.lastIndexOf('.');
-        if (extensionIndex > 0) {
-            base = base.substring(0, extensionIndex);
-        }
-        String[] tokens = base.replace('_', ' ').replace('-', ' ').trim().split("\\s+");
-        List<String> words = new ArrayList<>();
-        for (int i = 0; i < tokens.length; i++) {
-            String token = tokens[i].replaceAll("[^\\p{L}]", "");
-            if (token.isBlank()) {
-                continue;
-            }
-            String lower = token.toLowerCase(Locale.ROOT);
-            if (NAME_BLOCKLIST.contains(lower)
-                    || "email".equals(lower)
-                    || "gmail".equals(lower)
-                    || "yahoo".equals(lower)
-                    || "hotmail".equals(lower)
-                    || "outlook".equals(lower)
-                    || "resume".equals(lower)
-                    || "cv".equals(lower)
-                    || "com".equals(lower)
-                    || "net".equals(lower)
-                    || "org".equals(lower)) {
-                continue;
-            }
-            words.add(i > 0 && NAME_PARTICLES.contains(lower) ? lower : titleCaseToken(lower));
-        }
-        String result = String.join(" ", words).trim();
-        return result.isEmpty() ? "Candidate" : result;
-    }
-
-    private static String nameFromEmail(String text) {
-        String email = extractEmail(text);
-        if (email.isBlank()) {
-            return "";
-        }
-        int atIndex = email.indexOf('@');
-        if (atIndex <= 0) {
-            return "";
-        }
-        String local = email.substring(0, atIndex).toLowerCase(Locale.ROOT);
-        String[] rawTokens = local.replaceAll("[^\\p{L}]+", " ").trim().split("\\s+");
-        List<String> tokens = Arrays.stream(rawTokens)
-                .filter(token -> !token.isBlank())
-                .map(token -> token.replaceAll("\\d+", ""))
-                .filter(token -> !token.isBlank())
-                .toList();
-        if (tokens.size() < 2 || tokens.size() > 5) {
-            return "";
-        }
-        List<String> nameTokens = new ArrayList<>();
-        for (int i = 0; i < tokens.size(); i++) {
-            String token = tokens.get(i);
-            if (!NAME_TOKEN_PATTERN.matcher(token).matches()) {
-                return "";
-            }
-            String lower = token.toLowerCase(Locale.ROOT);
-            nameTokens.add(i > 0 && NAME_PARTICLES.contains(lower) ? lower : titleCaseToken(lower));
-        }
-        return String.join(" ", nameTokens).trim();
-    }
-
-    private static boolean looksLikeLocationPhrase(String value) {
-        if (value == null || value.isBlank()) {
-            return false;
-        }
-        String compact = value.trim();
-        String lower = compact.toLowerCase(Locale.ROOT);
-        if (lower.contains("remote") || lower.contains("hybrid") || lower.contains("onsite") || lower.contains("on-site")) {
-            return true;
-        }
-        Matcher cityStateMatcher = CITY_STATE_PATTERN.matcher(compact);
-        if (cityStateMatcher.find()) {
-            String stateCode = cityStateMatcher.group(2).trim().toUpperCase(Locale.ROOT);
-            if (US_STATE_CODES.contains(stateCode)) {
-                return true;
-            }
-        }
-        List<String> words = Arrays.stream(lower.split("[^\\p{L}]+"))
-                .filter(word -> !word.isBlank())
-                .toList();
-        if (words.size() < 2 || words.size() > 5) {
-            return false;
-        }
-        long hints = words.stream().filter(LOCATION_HINT_WORDS::contains).count();
-        return hints >= 2;
     }
 
     private static SkillExtraction extractSkillExtraction(String text) {
@@ -1022,7 +933,8 @@ public class CandidateProfileService {
             String phone,
             String linkedinUrl,
             String githubUrl,
-            String portfolioUrl) {
+            String portfolioUrl,
+            String llmSummary) {
         String compact = text.replaceAll("\\s+", " ").trim();
         List<String> sections = new ArrayList<>();
 
@@ -1056,6 +968,9 @@ public class CandidateProfileService {
         }
         if (suggestedRoles != null && !suggestedRoles.isEmpty()) {
             sections.add("Role alignment: " + String.join(", ", suggestedRoles) + ".");
+        }
+        if (llmSummary != null && !llmSummary.isBlank()) {
+            sections.add("Profile summary: " + llmSummary + ".");
         }
 
         List<String> highlights = extractSummaryHighlights(compact);
@@ -1109,108 +1024,6 @@ public class CandidateProfileService {
             return compact;
         }
         return compact.substring(0, maxChars).trim() + "...";
-    }
-
-    private static String extractEmail(String text) {
-        if (text == null || text.isBlank()) {
-            return "";
-        }
-        Matcher matcher = EMAIL_PATTERN.matcher(text);
-        return matcher.find() ? matcher.group(1).trim() : "";
-    }
-
-    private static String extractPhone(String text) {
-        if (text == null || text.isBlank()) {
-            return "";
-        }
-        Matcher matcher = PHONE_PATTERN.matcher(text);
-        while (matcher.find()) {
-            String normalized = normalizePhoneNumber(matcher.group(1));
-            if (!normalized.isBlank()) {
-                return normalized;
-            }
-        }
-        return "";
-    }
-
-    private static String normalizePhoneNumber(String rawPhone) {
-        if (rawPhone == null || rawPhone.isBlank()) {
-            return "";
-        }
-        String compact = rawPhone.trim().replaceAll("\\s+", " ");
-        compact = compact.replaceAll("(?i)(?:ext\\.?|extension|x)\\s*\\d{1,5}\\s*$", "").trim();
-        if (compact.isBlank()) {
-            return "";
-        }
-
-        boolean hasPlusPrefix = compact.startsWith("+");
-        String digits = compact.replaceAll("\\D", "");
-        if (digits.length() < 10 || digits.length() > 15) {
-            return "";
-        }
-
-        if (hasPlusPrefix) {
-            return "+" + digits;
-        }
-        if (digits.length() == 10) {
-            // Default to US country code when only a 10-digit local number is provided.
-            return "+1" + digits;
-        }
-        return "+" + digits;
-    }
-
-    private static String extractLinkedinUrl(String text) {
-        return extractUrlByHost(text, "linkedin.com");
-    }
-
-    private static String extractGithubUrl(String text) {
-        return extractUrlByHost(text, "github.com");
-    }
-
-    private static String extractPortfolioUrl(String text) {
-        if (text == null || text.isBlank()) {
-            return "";
-        }
-        Matcher matcher = WEB_URL_PATTERN.matcher(text);
-        while (matcher.find()) {
-            int start = matcher.start(1);
-            int end = matcher.end(1);
-            if (start > 0 && text.charAt(start - 1) == '@') {
-                continue;
-            }
-            if (end < text.length() && text.charAt(end) == '@') {
-                continue;
-            }
-            String raw = matcher.group(1).trim();
-            String lower = raw.toLowerCase(Locale.ROOT);
-            if (lower.contains("linkedin.com") || lower.contains("github.com")) {
-                continue;
-            }
-            if (lower.startsWith("mailto:")) {
-                continue;
-            }
-            return raw.startsWith("http://") || raw.startsWith("https://")
-                    ? raw
-                    : "https://" + raw.replaceFirst("^www\\.", "");
-        }
-        return "";
-    }
-
-    private static String extractUrlByHost(String text, String host) {
-        if (text == null || text.isBlank()) {
-            return "";
-        }
-        Matcher matcher = URL_PATTERN.matcher(text);
-        while (matcher.find()) {
-            String raw = matcher.group(1).trim();
-            String lower = raw.toLowerCase(Locale.ROOT);
-            if (lower.contains(host)) {
-                return raw.startsWith("http://") || raw.startsWith("https://")
-                        ? raw
-                        : "https://" + raw.replaceFirst("^www\\.", "");
-            }
-        }
-        return "";
     }
 
     private static String computeContentHash(String text) {

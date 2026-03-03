@@ -1,13 +1,18 @@
 package com.example.rag.candidate;
 
+import dev.langchain4j.model.chat.ChatModel;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
 
 class CandidateProfileServiceTest {
 
@@ -40,6 +45,23 @@ class CandidateProfileServiceTest {
 
         CandidateProfile profile = service.getBySourceFilename("latex-name.pdf").orElseThrow();
         assertThat(profile.displayName()).isEqualTo("Jose Adrian Aleman Rojas");
+    }
+
+    @Test
+    void indexResume_extractsNameFromUppercaseFragmentedHeader(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("Cv_Ana_Rodr_guez_Meza.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                A NA  R ODR ÍGUEZ M EZA
+                Costa Rica, Alajuela | (+506) 84579708 | anrodriguezme@gmail.com | LinkedIn
+                Highly motivated and detail-oriented Information Technology Engineer.
+                """;
+        service.indexResume("Cv_Ana_Rodr_guez_Meza.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("Cv_Ana_Rodr_guez_Meza.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Ana Rodríguez Meza");
     }
 
     @Test
@@ -292,5 +314,92 @@ class CandidateProfileServiceTest {
         CandidateProfile merged = service.getBySourceFilename("jane-doe-v2.pdf").orElseThrow();
         assertThat(merged.sourceFilename()).isEqualTo("jane-doe-v1.pdf");
         assertThat(merged.sourceFilenames()).containsExactlyInAnyOrder("jane-doe-v1.pdf", "jane-doe-v2.pdf");
+    }
+
+    @Test
+    void indexResume_storesVersionProvenanceMetadata(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("provenance-test.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Jane Doe
+                jane.doe@example.com
+                Senior backend engineer with 8 years of Java and Spring experience.
+                """;
+
+        service.indexResume("provenance-test.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("provenance-test.pdf").orElseThrow();
+        CandidateProfileVersion latest = profile.versions().getFirst();
+        assertThat(latest.extractionMethod()).isEqualTo("rules-only");
+        assertThat(latest.normalizedContentHash()).isNotBlank();
+        assertThat(latest.normalizedTextChars()).isPositive();
+        assertThat(latest.fieldConfidence()).containsKey("email");
+        assertThat(latest.fieldEvidence()).containsEntry("email", "jane.doe@example.com");
+    }
+
+    @Test
+    void indexResume_withEnabledLlmUsesHybridExtractionMetadata(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        ChatModel chatModel = Mockito.mock(ChatModel.class);
+        when(chatModel.chat(anyString())).thenReturn("""
+                {
+                  "displayName": "Maria Fernanda Solis",
+                  "summary": "QA engineer focused on automation and API testing.",
+                  "skills": ["selenium", "cypress", "postman"],
+                  "significantSkills": ["qa", "testing", "selenium"],
+                  "suggestedRoles": ["QA / Test Engineer"],
+                  "estimatedYearsExperience": 6,
+                  "location": "San Jose, CR",
+                  "fieldConfidence": {"displayName": 0.93, "skills": 0.88, "estimatedYearsExperience": 0.91},
+                  "fieldEvidence": {"displayName": "Header line includes Maria Fernanda Solis"}
+                }
+                """);
+        ResumeLlmEnrichmentService enrichmentService = new ResumeLlmEnrichmentService(chatModel);
+        ReflectionTestUtils.setField(enrichmentService, "enabled", true);
+        ReflectionTestUtils.setField(enrichmentService, "maxChars", 4000);
+        service.setLlmEnrichmentService(enrichmentService);
+
+        Path resume = tempDir.resolve("candidate_01.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+        String text = """
+                Professional Resume
+                QA automation expert with test engineering delivery.
+                Selenium Cypress Postman
+                """;
+
+        service.indexResume("candidate_01.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("candidate_01.pdf").orElseThrow();
+        CandidateProfileVersion latest = profile.versions().getFirst();
+        assertThat(profile.displayName()).isEqualTo("Maria Fernanda Solis");
+        assertThat(latest.extractionMethod()).isEqualTo("hybrid-llm-rules");
+        assertThat(latest.fieldConfidence()).containsKeys("displayName", "skills", "estimatedYearsExperience");
+        assertThat(latest.fieldEvidence()).containsKey("displayName");
+        assertThat(profile.preview()).contains("Profile summary: QA engineer focused on automation and API testing.");
+    }
+
+    @Test
+    void indexResume_withDisabledLlmDoesNotCreateLlmFallbackWarning(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        ChatModel chatModel = Mockito.mock(ChatModel.class);
+        ResumeLlmEnrichmentService enrichmentService = new ResumeLlmEnrichmentService(chatModel);
+        ReflectionTestUtils.setField(enrichmentService, "enabled", false);
+        service.setLlmEnrichmentService(enrichmentService);
+
+        Path resume = tempDir.resolve("disabled-llm.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+        service.indexResume("disabled-llm.pdf", resume, """
+                Juan Perez
+                juan.perez@example.com
+                Java Spring AWS
+                """);
+
+        CandidateProfile profile = service.getBySourceFilename("disabled-llm.pdf").orElseThrow();
+        CandidateProfileVersion latest = profile.versions().getFirst();
+        assertThat(latest.extractionMethod()).isEqualTo("rules-only");
+        assertThat(latest.validationWarnings())
+                .noneMatch(warning -> warning.toLowerCase().contains("llm enrichment unavailable"));
     }
 }

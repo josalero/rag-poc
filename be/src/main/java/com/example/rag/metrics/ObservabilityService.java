@@ -14,6 +14,9 @@ public class ObservabilityService {
     private final AtomicLong ingestRunCount = new AtomicLong();
     private final AtomicLong ingestProcessed = new AtomicLong();
     private final AtomicLong ingestSkipped = new AtomicLong();
+    private final AtomicLong candidateExtractionLlmAttempts = new AtomicLong();
+    private final AtomicLong candidateExtractionLlmFailures = new AtomicLong();
+    private final AtomicLong candidateExtractionValidationWarnings = new AtomicLong();
 
     public void recordQuery(long latencyMs, int sourcesReturned) {
         queryCount.incrementAndGet();
@@ -31,6 +34,16 @@ public class ObservabilityService {
         ingestSkipped.addAndGet(Math.max(skipped, 0));
     }
 
+    public void recordCandidateExtraction(boolean llmAttempted, boolean llmFailed, int validationWarnings) {
+        if (llmAttempted) {
+            candidateExtractionLlmAttempts.incrementAndGet();
+        }
+        if (llmFailed) {
+            candidateExtractionLlmFailures.incrementAndGet();
+        }
+        candidateExtractionValidationWarnings.addAndGet(Math.max(validationWarnings, 0));
+    }
+
     public ObservabilitySummary summary() {
         long totalQueries = queryCount.get();
         long errors = queryErrors.get();
@@ -44,7 +57,10 @@ public class ObservabilityService {
                 totalQueries == 0 ? 0.0d : (double) totalSources / totalQueries,
                 ingestRunCount.get(),
                 ingestProcessed.get(),
-                ingestSkipped.get()
+                ingestSkipped.get(),
+                candidateExtractionLlmAttempts.get(),
+                candidateExtractionLlmFailures.get(),
+                candidateExtractionValidationWarnings.get()
         );
     }
 }

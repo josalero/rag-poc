@@ -8,6 +8,9 @@ public record ObservabilitySummary(
         double avgSourcesPerQuery,
         long ingestRunCount,
         long ingestProcessed,
-        long ingestSkipped
+        long ingestSkipped,
+        long candidateExtractionLlmAttempts,
+        long candidateExtractionLlmFailures,
+        long candidateExtractionValidationWarnings
 ) {
 }
