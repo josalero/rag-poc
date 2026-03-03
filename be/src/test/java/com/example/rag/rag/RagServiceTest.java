@@ -152,4 +152,24 @@ class RagServiceTest {
         assertThat(response.sources().get(0).vectorScore()).isEqualTo(0.95);
         assertThat(response.sources().get(1).source()).isEqualTo("bob.pdf");
     }
+
+    @Test
+    void query_withIntentPhrasing_doesNotPenalizeReactSkillLookup() {
+        Embedding queryEmbedding = new Embedding(new float[]{0.5f});
+        TextSegment segment = TextSegment.from("Frontend engineer with React and TypeScript experience.");
+        segment.metadata().put("source", "react-candidate.pdf");
+        EmbeddingMatch<TextSegment> match = new EmbeddingMatch<>(0.72, "id-react", queryEmbedding, segment);
+        EmbeddingSearchResult<TextSegment> searchResult = new EmbeddingSearchResult<>(List.of(match));
+
+        when(embeddingModel.embed(any(String.class))).thenReturn(Response.from(queryEmbedding));
+        when(embeddingStore.search(any())).thenReturn(searchResult);
+        when(chatModel.chat(anyString())).thenReturn("Found candidates with React experience.");
+
+        QueryResponse response = ragService.query("I need candidates with React");
+
+        assertThat(response.sources()).hasSize(1);
+        assertThat(response.sources().get(0).source()).isEqualTo("react-candidate.pdf");
+        assertThat(response.sources().get(0).keywordScore()).isEqualTo(1.0d);
+        assertThat(response.sources().get(0).score()).isCloseTo(0.776d, org.assertj.core.data.Offset.offset(0.0001d));
+    }
 }

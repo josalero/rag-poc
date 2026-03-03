@@ -44,6 +44,17 @@ flowchart TB
     MC --> MS["ObservabilityService"]
 ```
 
+## Additional API modules
+
+- Matching:
+  - `POST /api/match` -> `JobMatchController`.
+- Resume access and export:
+  - `GET /api/resumes/{filename}` -> `ResumeController`.
+  - `GET /api/export/candidates.csv` -> `CandidateExportController`.
+- Evaluation and integrations:
+  - `POST /api/evals/run` -> `RagEvalController`.
+  - `POST /api/integrations/ats/push`, `GET /api/integrations/ats/events` -> `AtsIntegrationController`.
+
 ## Data planes
 
 - Retrieval plane:

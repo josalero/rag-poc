@@ -1450,11 +1450,16 @@ function MatchTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                     render: (value: number) => `${(value * 100).toFixed(0)}%`,
                   },
                   {
-                    title: 'Years',
-                    dataIndex: 'yearsFit',
-                    key: 'yearsFit',
-                    width: 100,
-                    render: (value: number) => `${(value * 100).toFixed(0)}%`,
+                    title: 'Roles',
+                    dataIndex: 'suggestedRoles',
+                    key: 'suggestedRoles',
+                    width: 240,
+                    render: (values?: string[]) => {
+                      const roles = Array.isArray(values) ? values : []
+                      return roles.length > 0
+                        ? roles.slice(0, 3).map((value) => <Tag color="geekblue" key={value}>{value}</Tag>)
+                        : <Text type="secondary">-</Text>
+                    },
                   },
                   {
                     title: 'Missing Must-have',

@@ -34,6 +34,10 @@ Where:
 - `vector_score` is returned by embedding similarity search.
 - `keyword_overlap_score` is matched query terms ratio over normalized text.
 
+Default threshold baseline:
+
+- minimum score defaults to `0.75` (service property `app.rag.min-score`, overridden per request when provided).
+
 ## Result shaping
 
 - Deduplication key policy:

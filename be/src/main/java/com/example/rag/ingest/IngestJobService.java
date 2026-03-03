@@ -53,7 +53,7 @@ public class IngestJobService {
     }
 
     private void runFolderJob(MutableJob job) {
-        job.status = "running";
+        job.markRunning();
         try {
             resumeIngestionService.ingestFromFolder(event -> {
                 if (!"file".equals(event.type())) {
@@ -61,27 +61,19 @@ public class IngestJobService {
                 }
                 String filename = event.filename() != null ? event.filename() : "unknown";
                 if ("ingested".equals(event.status())) {
-                    job.processed += 1;
-                    job.message = "Ingested " + filename;
+                    job.recordIngested(filename);
                 } else if ("skipped".equals(event.status())) {
-                    job.skipped += 1;
                     String reason = event.reason() != null && !event.reason().isBlank()
                             ? ": " + event.reason()
                             : "";
-                    job.message = "Skipped " + filename + reason;
+                    job.recordSkipped(filename, reason);
                 }
             });
-            job.status = "completed";
-            job.finishedAt = Instant.now();
-            job.message = "Folder ingestion completed (" + job.processed + " processed, " + job.skipped + " skipped)";
+            job.markCompleted();
         } catch (IOException e) {
-            job.status = "failed";
-            job.finishedAt = Instant.now();
-            job.message = e.getMessage();
+            job.markFailed(e.getMessage());
         } catch (RuntimeException e) {
-            job.status = "failed";
-            job.finishedAt = Instant.now();
-            job.message = e.getMessage();
+            job.markFailed(e.getMessage());
             throw e;
         }
     }
@@ -90,11 +82,11 @@ public class IngestJobService {
         private final String id;
         private final String type;
         private final Instant startedAt;
-        private volatile String status;
-        private volatile int processed;
-        private volatile int skipped;
-        private volatile Instant finishedAt;
-        private volatile String message;
+        private String status;
+        private int processed;
+        private int skipped;
+        private Instant finishedAt;
+        private String message;
 
         private MutableJob(String id, String type) {
             this.id = id;
@@ -107,17 +99,45 @@ public class IngestJobService {
             this.message = "";
         }
 
+        private synchronized void markRunning() {
+            this.status = "running";
+        }
+
+        private synchronized void recordIngested(String filename) {
+            this.processed += 1;
+            this.message = "Ingested " + filename;
+        }
+
+        private synchronized void recordSkipped(String filename, String reasonSuffix) {
+            this.skipped += 1;
+            this.message = "Skipped " + filename + reasonSuffix;
+        }
+
+        private synchronized void markCompleted() {
+            this.message = "Folder ingestion completed (" + this.processed + " processed, " + this.skipped + " skipped)";
+            this.finishedAt = Instant.now();
+            this.status = "completed";
+        }
+
+        private synchronized void markFailed(String failureMessage) {
+            this.message = failureMessage != null ? failureMessage : "Ingestion failed";
+            this.finishedAt = Instant.now();
+            this.status = "failed";
+        }
+
         private IngestJobStatus toSnapshot() {
-            return new IngestJobStatus(
-                    id,
-                    type,
-                    status,
-                    processed,
-                    skipped,
-                    startedAt,
-                    finishedAt,
-                    message
-            );
+            synchronized (this) {
+                return new IngestJobStatus(
+                        id,
+                        type,
+                        status,
+                        processed,
+                        skipped,
+                        startedAt,
+                        finishedAt,
+                        message
+                );
+            }
         }
     }
 }

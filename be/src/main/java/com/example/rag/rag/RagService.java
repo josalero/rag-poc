@@ -65,7 +65,9 @@ public class RagService {
             "was", "were", "into", "about", "which", "when", "where", "who", "what",
             "how", "why", "can", "you", "their", "they", "them", "your", "our", "all",
             "any", "not", "use", "using", "more", "than", "over", "under", "does", "did",
-            "been", "will", "would", "could", "should", "between", "after", "before", "through"
+            "been", "will", "would", "could", "should", "between", "after", "before", "through",
+            "need", "needs", "want", "wants", "looking", "search", "find", "show", "list",
+            "candidate", "candidates", "profile", "profiles", "resume", "resumes"
     );
 
     private static final Set<String> SENSITIVE_ATTRIBUTE_TERMS = Set.of(

@@ -65,6 +65,43 @@ class CandidateProfileServiceTest {
     }
 
     @Test
+    void indexResume_extractsNameFromPersonalInformationLineWithTrailingPeriod(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("Ricardo_Jarquin_QA_automation.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Personal Information:
+                Ricardo Jarquín Durán.
+                San José Costa Rica
+                (506) 8837-6179
+                rjarquind@gmail.com
+                """;
+        service.indexResume("Ricardo_Jarquin_QA_automation.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("Ricardo_Jarquin_QA_automation.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Ricardo Jarquín Durán");
+    }
+
+    @Test
+    void indexResume_fallbackFromFilename_ignoresDuplicatedPdfSuffixNoise(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("CV_Anthony_Playmith.pdf-1.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                LinkedIn: https://www.linkedin.com/in/anthony-playmith-008ba9158/
+                Cellphone: +506 8524-3205
+                Email: anthonypsa1998@gmail.com
+                Senior Software QA Engineer with 6+ years of experience.
+                """;
+        service.indexResume("CV_Anthony_Playmith.pdf-1.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("CV_Anthony_Playmith.pdf-1.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Anthony Playmith");
+    }
+
+    @Test
     void indexResume_extractsNameFromStandardHeaderWithRoleSuffix(@TempDir Path tempDir) throws IOException {
         CandidateProfileService service = new CandidateProfileService();
         Path resume = tempDir.resolve("standard-name.pdf");
@@ -96,6 +133,68 @@ class CandidateProfileServiceTest {
 
         CandidateProfile profile = service.getBySourceFilename("email-msancho01-gmail-com.pdf").orElseThrow();
         assertThat(profile.displayName()).isEqualTo("Martin Sancho Rojas");
+    }
+
+    @Test
+    void indexResume_extractsNameWhenHeaderContainsPdfUnicodeArtifacts(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("Martin_Sancho_Resume.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Mart́ın Sancho Vargas
+                Alajuela, Costa Rica
+                +506 7018-7580
+                msancho01@gmail.com
+                Technical Skills
+                Databases: MySQL, PostgreSQL, MSSQL, DynamoDB, Redis
+                """;
+        service.indexResume("Martin_Sancho_Resume.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("Martin_Sancho_Resume.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Martin Sancho Vargas");
+    }
+
+    @Test
+    void indexResume_prefersHeaderNameOverCompanyLocationLine(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("Resume_Joshymar_Moncada_Williams__1_.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                `Joshymar Moncada Williams       Senior Software developer
+                San José, Costa Rica    506 8372-1622 – joshymar.moncada@outlook.com
+                C# Development| Front-End Development| Problem-Solving| Agile| Full Stack
+                Fullstack Developer            Oct. 2024 - present
+                Firmex Inc.                                    Heredia, Costa Ricae
+                """;
+        service.indexResume("Resume_Joshymar_Moncada_Williams__1_.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("Resume_Joshymar_Moncada_Williams__1_.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Joshymar Moncada Williams");
+    }
+
+    @Test
+    void indexResume_extractsSplitUppercaseNameOverEducationDegreeLine(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("inbound3469059623528656753.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                EDUCATION
+                A young professional in Systems Engineering with comprehensive training.
+                ADRIÁN
+                CAMPOS
+                BACH. SYSTEMS ENGINEERING
+                Universidad FIDÉLITAS
+                +506 84313347
+                adrian212003@gmail.com
+                San José, Costa Rica
+                """;
+        service.indexResume("inbound3469059623528656753.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("inbound3469059623528656753.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Adrián Campos");
     }
 
     @Test

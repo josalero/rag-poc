@@ -16,7 +16,9 @@
 | `POST /api/ingest/stream` | synchronous folder run with SSE | file-level events + done |
 | `POST /api/ingest/upload` | synchronous uploaded files | aggregate + file events |
 | `POST /api/ingest/jobs/folder` | async job launcher | job snapshot |
+| `POST /api/ingest/jobs` | async default job launcher (alias) | job snapshot |
 | `GET /api/ingest/jobs` | job monitor | job list |
+| `GET /api/ingest/jobs/{id}` | async job monitor | single job snapshot |
 
 ## Folder ingest concurrency model
 
@@ -66,6 +68,14 @@ sequenceDiagram
   - ingest continues with remaining files.
 - Read/parse failures:
   - deterministic skip event and run-level skipped increment.
+
+## Background job state consistency
+
+- `IngestJobService` keeps mutable job state synchronized for:
+  - status transitions (`queued -> running -> completed|failed`).
+  - counters (`processed`, `skipped`) and user-visible `message`.
+  - atomic snapshot reads used by `/api/ingest/jobs` and `/api/ingest/jobs/{id}`.
+- Terminal transitions are emitted with coherent snapshot content so polling clients do not observe partial terminal states.
 
 ## Virtual thread controls
 

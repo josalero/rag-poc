@@ -6,6 +6,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.text.Normalizer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -13,13 +14,23 @@ final class CandidateNameExtractor {
 
     private static final Set<String> NAME_BLOCKLIST = Set.of(
             "summary", "experience", "education", "skills", "projects", "profile", "contact",
-            "objective", "certifications", "resume", "curriculum", "vitae", "linkedin", "github"
+            "objective", "certifications", "resume", "curriculum", "vitae", "linkedin", "github",
+            "personal", "information", "pdf"
     );
 
     private static final Set<String> NAME_ROLE_NOISE = Set.of(
             "engineer", "developer", "architect", "manager", "consultant", "intern", "software",
             "qa", "sdet", "tester", "devops", "platform", "cloud", "frontend", "backend",
             "full", "stack", "senior", "junior", "principal", "lead"
+    );
+    private static final Set<String> NAME_TECH_NOISE = Set.of(
+            "api", "apis", "aws", "azure", "ci", "cd", "cicd", "docker", "kubernetes", "git", "gitlab",
+            "github", "jira", "python", "ruby", "rails", "java", "javascript", "typescript", "csharp",
+            "mysql", "postgresql", "mssql", "dynamodb", "redis", "elasticsearch", "databases", "scrum",
+            "agile", "selenium", "cypress", "postman", "automation", "testing", "qa", "devops"
+    );
+    private static final Set<String> NAME_COMPANY_NOISE = Set.of(
+            "inc", "inc.", "llc", "ltd", "ltda", "corp", "co", "company", "corporation", "s.a", "sa"
     );
 
     private static final Set<String> LOCATION_HINT_WORDS = Set.of(
@@ -40,7 +51,7 @@ final class CandidateNameExtractor {
     );
 
     private static final Pattern CITY_STATE_PATTERN = Pattern.compile("([A-Z][a-z]+(?:[\\s\\-'][A-Z][a-z]+)*,\\s*([A-Z]{2}))");
-    private static final Pattern NAME_TOKEN_PATTERN = Pattern.compile("^[\\p{L}][\\p{L}.\\-']*$");
+    private static final Pattern NAME_TOKEN_PATTERN = Pattern.compile("^[\\p{L}][\\p{L}\\p{M}.\\-']*$");
     private static final Pattern NAME_SEGMENT_SPLIT_PATTERN = Pattern.compile("\\s(?:\\||•|·|—|–|:)\\s|\\s+-\\s");
     private static final Pattern NAME_WITH_ROLE_SUFFIX_PATTERN = Pattern.compile(
             "^([\\p{L}][\\p{L}.\\-']*(?:\\s+[\\p{L}][\\p{L}.\\-']*){1,3})\\s+"
@@ -61,7 +72,9 @@ final class CandidateNameExtractor {
         String bestName = "";
         double bestScore = Double.NEGATIVE_INFINITY;
         for (int i = 0; i < candidateLines.size(); i++) {
-            for (String lineVariant : expandCandidateLineVariants(candidateLines.get(i))) {
+            LinkedHashSet<String> variants = new LinkedHashSet<>(expandCandidateLineVariants(candidateLines.get(i)));
+            variants.addAll(expandAdjacentNameTokenVariants(candidateLines, i));
+            for (String lineVariant : variants) {
                 String candidate = normalizeCandidateName(lineVariant);
                 if (candidate.isBlank()) {
                     continue;
@@ -84,6 +97,52 @@ final class CandidateNameExtractor {
         }
 
         return nameFromFilename(filename);
+    }
+
+    private static List<String> expandAdjacentNameTokenVariants(List<String> lines, int index) {
+        if (lines == null || index < 0 || index >= lines.size()) {
+            return List.of();
+        }
+        String current = lines.get(index);
+        if (!isSingleTokenUpperNameLine(current)) {
+            return List.of();
+        }
+
+        List<String> variants = new ArrayList<>();
+        if (index + 1 < lines.size() && isSingleTokenUpperNameLine(lines.get(index + 1))) {
+            variants.add(current + " " + lines.get(index + 1));
+            if (index + 2 < lines.size() && isSingleTokenUpperNameLine(lines.get(index + 2))) {
+                variants.add(current + " " + lines.get(index + 1) + " " + lines.get(index + 2));
+            }
+        }
+        return variants;
+    }
+
+    private static boolean isSingleTokenUpperNameLine(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        String compact = normalizePotentialNameText(value).replaceAll("\\s+", " ").trim();
+        if (compact.isBlank() || compact.contains("@") || compact.matches(".*\\d.*")) {
+            return false;
+        }
+        String[] tokens = compact.split("\\s+");
+        if (tokens.length != 1) {
+            return false;
+        }
+        String token = tokens[0].replaceAll("^[^\\p{L}]+|[^\\p{L}]+$", "");
+        if (token.length() < 2 || token.length() > 30) {
+            return false;
+        }
+        String lower = token.toLowerCase(Locale.ROOT);
+        if (NAME_BLOCKLIST.contains(lower)
+                || NAME_ROLE_NOISE.contains(lower)
+                || NAME_TECH_NOISE.contains(lower)
+                || NAME_COMPANY_NOISE.contains(lower)
+                || LOCATION_HINT_WORDS.contains(lower)) {
+            return false;
+        }
+        return isUppercaseToken(token);
     }
 
     static boolean isPlausibleDisplayName(String value) {
@@ -130,6 +189,14 @@ final class CandidateNameExtractor {
         if (extensionIndex > 0) {
             base = base.substring(0, extensionIndex);
         }
+        // Handle duplicated downloader suffixes such as ".pdf-1" before the final extension.
+        for (int i = 0; i < 3; i++) {
+            String next = base.replaceAll("(?i)\\.pdf(?:[-_ ]?\\d+)?$", "");
+            if (next.equals(base)) {
+                break;
+            }
+            base = next;
+        }
         String[] tokens = base.replace('_', ' ').replace('-', ' ').trim().split("\\s+");
         List<String> words = new ArrayList<>();
         for (int i = 0; i < tokens.length; i++) {
@@ -161,7 +228,7 @@ final class CandidateNameExtractor {
         if (line == null) {
             return "";
         }
-        String compact = line.replaceAll("\\s+", " ").trim();
+        String compact = normalizePotentialNameText(line).replaceAll("\\s+", " ").trim();
         if (compact.isBlank() || compact.length() > 80) {
             return "";
         }
@@ -182,6 +249,13 @@ final class CandidateNameExtractor {
         if (lineWords.stream().anyMatch(NAME_ROLE_NOISE::contains)) {
             return "";
         }
+        if (lineWords.stream().anyMatch(NAME_COMPANY_NOISE::contains)) {
+            return "";
+        }
+        long techNoiseHits = lineWords.stream().filter(NAME_TECH_NOISE::contains).count();
+        if (techNoiseHits >= 2) {
+            return "";
+        }
 
         List<String> rawTokens = Arrays.stream(compact.replace(',', ' ').replace(';', ' ').split("\\s+"))
                 .filter(token -> !token.isBlank())
@@ -195,6 +269,7 @@ final class CandidateNameExtractor {
         List<String> normalizedTokens = new ArrayList<>();
         for (int i = 0; i < normalizedTokensArray.length; i++) {
             String token = normalizedTokensArray[i].replaceAll("^[^\\p{L}]+|[^\\p{L}.\\-']+$", "");
+            token = token.replaceAll("\\.+$", "");
             if (token.isBlank() || !NAME_TOKEN_PATTERN.matcher(token).matches()) {
                 return "";
             }
@@ -206,6 +281,13 @@ final class CandidateNameExtractor {
             }
         }
         return String.join(" ", normalizedTokens).trim();
+    }
+
+    private static String normalizePotentialNameText(String value) {
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFC)
+                .replace('\u0131', 'i')
+                .replace('\u0130', 'I');
+        return normalized.replaceAll("\\p{M}+", "");
     }
 
     private static List<String> expandCandidateLineVariants(String line) {
@@ -350,11 +432,37 @@ final class CandidateNameExtractor {
         if (line == null || line.isBlank()) {
             return "";
         }
-        Matcher matcher = NAME_WITH_ROLE_SUFFIX_PATTERN.matcher(line.trim());
+        String cleaned = line.trim().replaceAll("^[^\\p{L}]+", "").trim();
+        Matcher matcher = NAME_WITH_ROLE_SUFFIX_PATTERN.matcher(cleaned);
         if (!matcher.matches()) {
-            return line.trim();
+            return cleaned;
         }
-        return matcher.group(1).trim();
+        return stripTrailingRoleTokens(matcher.group(1).trim());
+    }
+
+    private static String stripTrailingRoleTokens(String value) {
+        if (value == null || value.isBlank()) {
+            return "";
+        }
+        List<String> tokens = new ArrayList<>(Arrays.asList(value.trim().split("\\s+")));
+        while (tokens.size() > 1 && isRoleNoiseToken(tokens.get(tokens.size() - 1))) {
+            tokens.remove(tokens.size() - 1);
+        }
+        return String.join(" ", tokens).trim();
+    }
+
+    private static boolean isRoleNoiseToken(String token) {
+        if (token == null || token.isBlank()) {
+            return false;
+        }
+        String normalized = token.toLowerCase(Locale.ROOT).replaceAll("[^a-z]", "");
+        if (normalized.isBlank()) {
+            return false;
+        }
+        if ("fullstack".equals(normalized)) {
+            return true;
+        }
+        return NAME_ROLE_NOISE.contains(normalized);
     }
 
     private static List<String> collapseSingleLetterRuns(List<String> tokens) {

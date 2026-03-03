@@ -26,8 +26,12 @@ flowchart LR
 
 - Name extraction:
   - header-line candidate scoring.
-  - role-suffix stripping.
+  - unicode cleanup for PDF artifacts (combining marks and dotless-I variants).
+  - role-suffix stripping with trailing-role token cleanup.
+  - company-token rejection (`inc`, `llc`, `corp`, etc.).
+  - tech-stack phrase rejection (e.g. `Databases MySQL PostgreSQL ...`).
   - latex-like fragmented uppercase repair (e.g. split token joins).
+  - trailing punctuation trimming in name tokens.
   - fallback chain: header -> email-local-part -> filename.
 - Contact extraction:
   - email regex.
@@ -58,6 +62,13 @@ flowchart LR
 - Content-hash dedup:
   - prevents duplicate embedding for equal resume content.
   - duplicate file is merged into existing candidate profile source list/version history.
+
+## Name extraction regression scenarios
+
+- Real-world edge cases covered in tests:
+  - malformed diacritics in header (`Mart́ın Sancho Vargas`) no longer lose to skills lines.
+  - prefixed punctuation + inline role (`\`Joshymar Moncada Williams Senior ...`) no longer truncates to partial name.
+  - company/location lines (`Firmex Inc. Heredia, Costa Rica...`) are rejected as person-name candidates.
 
 ## Versioned provenance model
 

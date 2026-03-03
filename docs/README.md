@@ -2,6 +2,8 @@
 
 This folder contains architecture and implementation-level documentation for the Resume RAG Studio system.
 
+Last reviewed: 2026-03-03.
+
 ## Documents
 
 1. [System Architecture](./architecture.md)

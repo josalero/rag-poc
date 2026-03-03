@@ -39,6 +39,7 @@ stateDiagram-v2
   - when Candidates tab becomes active.
   - when page/pageSize/sort changes while tab is active.
   - when user clicks explicit Refresh.
+- Search/skill text changes alone do not auto-fetch; they apply when user presses `Find`.
 - Periodic polling is intentionally disabled for `/api/candidates`.
 
 ## Ingest UI execution modes
@@ -62,5 +63,6 @@ flowchart TD
   - source row "Candidate" button opens profile via hash route to `#/candidates?candidate=<id>`.
 - Candidates page:
   - table row action opens profile and lazy-loads full candidate payload.
+  - hash route `#/candidates?candidate=<id>` opens the profile modal directly.
 - Compare page:
   - candidate selectors fetch full profile snapshots for side-by-side rendering.
