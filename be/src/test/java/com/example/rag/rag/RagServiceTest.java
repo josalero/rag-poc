@@ -120,4 +120,33 @@ class RagServiceTest {
         verify(embeddingStore).search(requestCaptor.capture());
         assertThat(requestCaptor.getValue().maxResults()).isEqualTo(150);
     }
+
+    @Test
+    void query_withDuplicateChunksFromSameSource_returnsUniqueSources() {
+        Embedding queryEmbedding = new Embedding(new float[]{0.4f});
+
+        TextSegment firstChunk = TextSegment.from("Alice has strong Java backend experience.");
+        firstChunk.metadata().put("source", "alice.pdf");
+        TextSegment secondChunk = TextSegment.from("Alice also worked with Spring Boot and microservices.");
+        secondChunk.metadata().put("source", "alice.pdf");
+        TextSegment otherSourceChunk = TextSegment.from("Bob has Kubernetes and Terraform experience.");
+        otherSourceChunk.metadata().put("source", "bob.pdf");
+
+        EmbeddingMatch<TextSegment> aliceBest = new EmbeddingMatch<>(0.95, "id-a1", queryEmbedding, firstChunk);
+        EmbeddingMatch<TextSegment> aliceDuplicate = new EmbeddingMatch<>(0.91, "id-a2", queryEmbedding, secondChunk);
+        EmbeddingMatch<TextSegment> bobMatch = new EmbeddingMatch<>(0.88, "id-b1", queryEmbedding, otherSourceChunk);
+        EmbeddingSearchResult<TextSegment> searchResult = new EmbeddingSearchResult<>(List.of(aliceBest, aliceDuplicate, bobMatch));
+
+        when(embeddingModel.embed(any(String.class))).thenReturn(Response.from(queryEmbedding));
+        when(embeddingStore.search(any())).thenReturn(searchResult);
+        when(chatModel.chat(anyString())).thenReturn("Alice and Bob match the query.");
+
+        QueryResponse response = ragService.query("Who has backend and platform skills?");
+
+        assertThat(response.sources()).hasSize(2);
+        assertThat(response.totalSources()).isEqualTo(2);
+        assertThat(response.sources().get(0).source()).isEqualTo("alice.pdf");
+        assertThat(response.sources().get(0).score()).isEqualTo(0.95);
+        assertThat(response.sources().get(1).source()).isEqualTo("bob.pdf");
+    }
 }

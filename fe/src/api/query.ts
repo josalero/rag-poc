@@ -4,26 +4,45 @@ export interface SourceSegment {
   text: string
   source: string
   score: number
+  rank: number
+  candidateId: string
 }
 
 export interface QueryResponse {
   answer: string
   sources: SourceSegment[]
+  page: number
+  pageSize: number
+  totalSources: number
 }
 
 export interface QueryOptions {
   maxResults?: number
   minScore?: number
+  page?: number
+  pageSize?: number
 }
 
 export async function querySkills(question: string, options?: QueryOptions): Promise<QueryResponse> {
   const base = getBaseUrl()
-  const body: { question: string; maxResults?: number; minScore?: number } = { question }
+  const body: {
+    question: string
+    maxResults?: number
+    minScore?: number
+    page?: number
+    pageSize?: number
+  } = { question }
   if (options?.maxResults !== undefined) {
     body.maxResults = options.maxResults
   }
   if (options?.minScore !== undefined) {
     body.minScore = options.minScore
+  }
+  if (options?.page !== undefined) {
+    body.page = options.page
+  }
+  if (options?.pageSize !== undefined) {
+    body.pageSize = options.pageSize
   }
   const res = await fetch(`${base}/api/query`, {
     method: 'POST',

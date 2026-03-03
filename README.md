@@ -104,7 +104,7 @@ The app listens on **http://localhost:8084**.
 
 ## 5. Ingest resumes into the vector store
 
-**Web UI (recommended):** Open **http://localhost:8084**, go to the **Ingest** tab, and click **Run ingestion**. The UI streams progress and lists each file as it’s ingested or skipped. Ingestion is idempotent: re-running does not duplicate data (existing segments per file are replaced).
+**Web UI (recommended):** Open **http://localhost:8084**, go to the **Ingest** tab, and click **Run ingestion**. The UI streams progress and lists each file as it’s ingested or skipped. **Only `.pdf` files are accepted**; non-PDF files are skipped with a clear reason. The ingest flow also detects duplicate resume content (via hash) and merges duplicates into one candidate profile instead of indexing duplicate embeddings.
 
 **API (one-shot):**
 
@@ -112,7 +112,7 @@ The app listens on **http://localhost:8084**.
 curl -X POST http://localhost:8084/api/ingest
 ```
 
-You should get something like `{"documentsProcessed": 5}`. If the folder is empty or missing, you get `0`.
+You should get something like `{"documentsProcessed": 5}`. If the folder is empty or missing, you get `0`. Only `.pdf` files are processed.
 
 **API (streaming):** `POST /api/ingest/stream` returns Server-Sent Events so you can see progress per file. The frontend uses this for the Ingest tab.
 
@@ -122,22 +122,25 @@ You should get something like `{"documentsProcessed": 5}`. If the folder is empt
 
 **Option A – Web UI**
 
-Open **http://localhost:8084** in a browser. The left-hand menu has **Query** and **Ingest**. Use **Query** to ask questions (e.g. “Who has experience with Java?”). Use **Ingest** to run ingestion (with live file-by-file progress).
+Open **http://localhost:8084** in a browser. The app now has tabs for **Query**, **Candidates**, **Compare**, **Ingest**, and **Audit**.
 
 **Option B – API (curl)**
 
 ```bash
 curl -X POST http://localhost:8084/api/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "Who has experience with Java?", "maxResults": 100, "minScore": 0.2}'
+  -d '{"question": "Who has experience with Java?", "maxResults": 100, "minScore": 0.2, "page": 1, "pageSize": 10}'
 ```
 
-Response shape: `{"answer": "...", "sources": [{"text": "...", "source": "filename.pdf"}, ...]}`.
-Each source includes a `score` field (similarity, higher is more relevant): `{"text":"...","source":"filename.pdf","score":0.87}`.
+Response shape: `{"answer":"...","sources":[...],"page":1,"pageSize":10,"totalSources":42}`.
+Each source includes:
+- `score` (similarity)
+- `rank` (global rank in the retrieval result set)
+- `candidateId` (for candidate details links)
 The `answer` text is sectioned (`ANSWER`, `KEY_FINDINGS`, `LIMITATIONS`, `NEXT_STEPS`) so the UI can render it in a structured way.
 
 Notes:
-- `maxResults` and `minScore` are optional per-query overrides.
+- `maxResults`, `minScore`, `page`, and `pageSize` are optional per-query overrides.
 - Returned sources are still similarity-ranked retrieval results (`top-k`), so "all qualifying" depends on the requested `maxResults` and the configured `RAG_MAX_ALLOWED_RESULTS`.
 
 **Option C – Swagger**
@@ -145,6 +148,16 @@ Notes:
 Open **http://localhost:8084/swagger-ui.html**, find **POST /api/query**, click “Try it out”, set the body to `{"question": "Your question here"}`, then “Execute”.
 
 ---
+
+## 7. Extra API endpoints
+
+- `GET /api/resumes/{filename}` – view resume PDF inline
+- `GET /api/resumes/{filename}?download=true` – download resume PDF
+- `GET /api/candidates` – candidate directory (`search`, `skill`, `location`, `sort`, `page`, `pageSize`)
+- `GET /api/candidates/{id}` – candidate details
+- `GET /api/ingest/audit` – ingestion run history
+- `POST /api/query/feedback` – submit helpful/not-helpful feedback for an answer
+- `GET /api/query/feedback/stats` – feedback aggregate stats
 
 ## Quick checklist
 

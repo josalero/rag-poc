@@ -7,5 +7,7 @@ import jakarta.validation.constraints.Positive;
 public record QueryRequest(
         @NotBlank String question,
         @Positive Integer maxResults,
-        @DecimalMin("0.0") Double minScore
+        @DecimalMin("0.0") Double minScore,
+        @Positive Integer page,
+        @Positive Integer pageSize
 ) {}

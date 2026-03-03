@@ -3,10 +3,14 @@ package com.example.rag.ingest;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -28,6 +32,32 @@ public class IngestController {
         try {
             int count = resumeIngestionService.ingestFromFolder();
             return ResponseEntity.ok(Map.of("documentsProcessed", count));
+        } catch (IOException e) {
+            return ResponseEntity.internalServerError()
+                    .body(Map.of("error", "Ingestion failed", "message", e.getMessage()));
+        }
+    }
+
+    @PostMapping(value = "/ingest/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Map<String, Object>> ingestUploaded(
+            @RequestParam(name = "files", required = false) List<MultipartFile> files) {
+        try {
+            List<ResumeIngestionService.UploadResume> uploads = new ArrayList<>();
+            if (files != null) {
+                for (MultipartFile file : files) {
+                    uploads.add(new ResumeIngestionService.UploadResume(file.getOriginalFilename(), file.getBytes()));
+                }
+            }
+
+            List<IngestProgressEvent> events = new ArrayList<>();
+            int count = resumeIngestionService.ingestUploadedResumes(uploads, events::add);
+            List<IngestProgressEvent> fileEvents = events.stream()
+                    .filter(event -> "file".equals(event.type()))
+                    .toList();
+            return ResponseEntity.ok(Map.of(
+                    "documentsProcessed", count,
+                    "fileEvents", fileEvents
+            ));
         } catch (IOException e) {
             return ResponseEntity.internalServerError()
                     .body(Map.of("error", "Ingestion failed", "message", e.getMessage()));

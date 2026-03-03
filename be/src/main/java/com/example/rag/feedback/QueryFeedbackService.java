@@ -1,0 +1,46 @@
+package com.example.rag.feedback;
+
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+@Service
+public class QueryFeedbackService {
+
+    private static final int MAX_ENTRIES = 1_000;
+
+    private final CopyOnWriteArrayList<QueryFeedbackEntry> entries = new CopyOnWriteArrayList<>();
+
+    public QueryFeedbackEntry addFeedback(QueryFeedbackRequest request) {
+        QueryFeedbackEntry entry = new QueryFeedbackEntry(
+                request.question().trim(),
+                request.answer().trim(),
+                request.helpful(),
+                request.notes() != null ? request.notes().trim() : "",
+                Instant.now());
+        entries.add(entry);
+        while (entries.size() > MAX_ENTRIES) {
+            entries.removeFirst();
+        }
+        return entry;
+    }
+
+    public FeedbackStats stats() {
+        int total = entries.size();
+        int helpful = (int) entries.stream().filter(QueryFeedbackEntry::helpful).count();
+        int notHelpful = total - helpful;
+        double helpfulRate = total == 0 ? 0.0 : (helpful * 100.0) / total;
+        return new FeedbackStats(total, helpful, notHelpful, helpfulRate);
+    }
+
+    public List<QueryFeedbackEntry> recent(int limit) {
+        int safeLimit = Math.max(1, Math.min(limit, 100));
+        List<QueryFeedbackEntry> snapshot = List.copyOf(entries);
+        int size = snapshot.size();
+        int from = Math.max(0, size - safeLimit);
+        List<QueryFeedbackEntry> tail = snapshot.subList(from, size);
+        return tail.reversed();
+    }
+}

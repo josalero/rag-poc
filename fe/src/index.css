@@ -1,1 +1,24 @@
 @import "tailwindcss";
+
+:root {
+  font-family: "Inter", "Segoe UI", "SF Pro Text", system-ui, -apple-system, sans-serif;
+  color: #10221e;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: linear-gradient(180deg, #f4faf7 0%, #ffffff 45%);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.ant-card {
+  overflow: hidden;
+}
+
+.ant-table-wrapper .ant-table-tbody > tr:hover > td {
+  background: #eefbf3 !important;
+}

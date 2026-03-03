@@ -13,6 +13,10 @@ spring:
   h2:
     console:
       enabled: true
+  servlet:
+    multipart:
+      max-file-size: ${MULTIPART_MAX_FILE_SIZE:100MB}
+      max-request-size: ${MULTIPART_MAX_REQUEST_SIZE:1GB}
 
 langchain4j:
   open-ai:
@@ -31,7 +35,7 @@ app:
   rag:
     max-results: ${RAG_MAX_RESULTS:50}
     max-allowed-results: ${RAG_MAX_ALLOWED_RESULTS:200}
-    min-score: ${RAG_MIN_SCORE:0.0}
+    min-score: ${RAG_MIN_SCORE:0.75}
     no-results-answer: ${RAG_NO_RESULTS_ANSWER:I couldn't find relevant information in the ingested resumes.}
   resumes:
     path: ${RESUMES_PATH:./downloaded-resumes}

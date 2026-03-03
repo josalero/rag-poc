@@ -23,7 +23,9 @@ public class SkillsQueryController {
         QueryResponse response = ragService.query(
                 request.question().trim(),
                 request.maxResults(),
-                request.minScore());
+                request.minScore(),
+                request.page(),
+                request.pageSize());
         return ResponseEntity.ok(response);
     }
 }

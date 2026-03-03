@@ -4,12 +4,31 @@ export interface IngestResponse {
   documentsProcessed: number
 }
 
+export interface IngestUploadResponse extends IngestResponse {
+  fileEvents: IngestProgressEvent[]
+}
+
 export interface IngestProgressEvent {
   type: 'file' | 'done'
   filename?: string
   status?: 'ingested' | 'skipped'
   reason?: string
   documentsProcessed?: number
+}
+
+async function parseError(res: Response): Promise<Error> {
+  const payload = await res.text().catch(() => '')
+  let message = payload || `Request failed: ${res.status}`
+  try {
+    const parsed = payload ? JSON.parse(payload) as { error?: string; message?: string } : {}
+    message = parsed.message ?? parsed.error ?? message
+  } catch {
+    // plain text fallback
+  }
+  if (res.status === 413 && (!message || message === `Request failed: ${res.status}`)) {
+    message = 'Upload too large. Choose fewer files or smaller PDFs, or use "Run Configured Server Folder".'
+  }
+  return new Error(message)
 }
 
 export async function triggerIngest(): Promise<IngestResponse> {
@@ -19,9 +38,23 @@ export async function triggerIngest(): Promise<IngestResponse> {
     headers: { 'Content-Type': 'application/json' },
   })
   if (!res.ok) {
-    const body = await res.json().catch(() => ({})) as { message?: string; error?: string }
-    const message = body.message ?? body.error ?? `Request failed: ${res.status}`
-    throw new Error(message)
+    throw await parseError(res)
+  }
+  return res.json()
+}
+
+export async function triggerIngestUpload(files: File[]): Promise<IngestUploadResponse> {
+  const base = getBaseUrl()
+  const formData = new FormData()
+  for (const file of files) {
+    formData.append('files', file, file.name)
+  }
+  const res = await fetch(`${base}/api/ingest/upload`, {
+    method: 'POST',
+    body: formData,
+  })
+  if (!res.ok) {
+    throw await parseError(res)
   }
   return res.json()
 }
@@ -41,8 +74,7 @@ export async function triggerIngestStream(
     headers: { Accept: 'text/event-stream' },
   })
   if (!res.ok) {
-    const text = await res.text()
-    onError(new Error(text || `Request failed: ${res.status}`))
+    onError(await parseError(res))
     return
   }
   const reader = res.body?.getReader()
