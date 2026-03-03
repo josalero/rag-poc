@@ -25,7 +25,8 @@ public class SkillsQueryController {
                 request.maxResults(),
                 request.minScore(),
                 request.page(),
-                request.pageSize());
+                request.pageSize(),
+                request.useFeedbackTuning());
         return ResponseEntity.ok(response);
     }
 }

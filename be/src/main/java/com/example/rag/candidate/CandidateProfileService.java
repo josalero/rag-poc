@@ -29,12 +29,27 @@ public class CandidateProfileService {
     private static final List<String> KNOWN_SKILLS = List.of(
             "java", "spring", "kotlin", "python", "typescript", "javascript", "react",
             "node", "postgresql", "mysql", "aws", "azure", "gcp", "docker", "kubernetes",
-            "terraform", "ci/cd", "git", "rest", "graphql", "langchain", "llm", "rag"
+            "terraform", "ci/cd", "git", "rest", "graphql", "langchain", "llm", "rag",
+            "qa", "testing", "selenium", "cypress", "playwright", "postman",
+            "cucumber", "testng", "junit", "jenkins", "ansible", "linux",
+            "bash", "prometheus", "grafana", "sre"
     );
 
     private static final Set<String> NAME_BLOCKLIST = Set.of(
             "summary", "experience", "education", "skills", "projects", "profile", "contact",
             "objective", "certifications", "resume", "curriculum", "vitae", "linkedin", "github"
+    );
+
+    private static final Set<String> NAME_ROLE_NOISE = Set.of(
+            "engineer", "developer", "architect", "manager", "consultant", "intern", "software",
+            "qa", "sdet", "tester", "devops", "platform", "cloud", "frontend", "backend",
+            "full", "stack", "senior", "junior", "principal", "lead"
+    );
+
+    private static final Set<String> LOCATION_HINT_WORDS = Set.of(
+            "remote", "hybrid", "onsite", "on", "site", "united", "states", "usa", "canada",
+            "mexico", "costa", "rica", "spain", "germany", "france", "italy", "uk", "england",
+            "brazil", "argentina", "colombia", "peru", "chile"
     );
 
     private static final Set<String> NAME_PARTICLES = Set.of(
@@ -66,14 +81,27 @@ public class CandidateProfileService {
     private static final Set<String> SENIOR_KEYWORDS = Set.of(
             "senior", "lead", "tech lead", "architect", "manager"
     );
-    private static final String LEADERSHIP_ROLE_TITLE = "Engineering Manager / Tech Lead";
-    private static final Set<String> LEADERSHIP_TRACK_KEYWORDS = Set.of(
-            "manager", "managed", "management", "team lead", "tech lead",
-            "engineering manager", "people manager", "head of engineering", "director"
+    private static final String QA_ROLE_TITLE = "QA / Test Engineer";
+    private static final String TECH_LEAD_ROLE_TITLE = "Tech Lead";
+    private static final String ENGINEERING_MANAGER_ROLE_TITLE = "Engineering Manager";
+    private static final Set<String> QA_TRACK_KEYWORDS = Set.of(
+            "qa", "quality assurance", "sdet", "test engineer", "software tester",
+            "test automation", "automation testing", "manual testing", "regression testing",
+            "api testing", "test cases"
+    );
+    private static final Set<String> TECH_LEAD_TRACK_KEYWORDS = Set.of(
+            "tech lead", "team lead", "lead engineer", "lead developer", "led team",
+            "architecture", "architected", "mentored", "technical leadership"
+    );
+    private static final Set<String> MANAGER_TRACK_KEYWORDS = Set.of(
+            "engineering manager", "people manager", "line manager", "manager of",
+            "managed team", "hiring", "performance review", "career development",
+            "director", "head of engineering"
     );
 
     private static final int SIGNIFICANT_SKILLS_LIMIT = 8;
-    private static final int SUGGESTED_ROLES_LIMIT = 2;
+    private static final int SUGGESTED_ROLES_LIMIT = 3;
+    private static final int VERSION_HISTORY_LIMIT = 30;
 
     private static final List<RoleDefinition> ROLE_DEFINITIONS = List.of(
             new RoleDefinition(
@@ -99,9 +127,16 @@ public class CandidateProfileService {
             ),
             new RoleDefinition(
                     "DevOps / Platform Engineer",
-                    List.of("DOCKER", "KUBERNETES", "TERRAFORM", "AWS", "AZURE", "GCP", "CI/CD"),
-                    List.of("devops", "platform", "infrastructure", "sre"),
+                    List.of("DOCKER", "KUBERNETES", "TERRAFORM", "AWS", "AZURE", "GCP", "CI/CD", "JENKINS", "ANSIBLE", "PROMETHEUS", "GRAFANA", "SRE"),
+                    List.of("devops", "platform", "infrastructure", "sre", "observability", "site reliability"),
                     4,
+                    null
+            ),
+            new RoleDefinition(
+                    "QA / Test Engineer",
+                    List.of("QA", "TESTING", "SELENIUM", "CYPRESS", "PLAYWRIGHT", "POSTMAN", "CUCUMBER", "TESTNG", "JUNIT"),
+                    List.of("qa", "quality assurance", "sdet", "test engineer", "software tester", "test automation", "automation testing", "manual testing", "regression testing", "api testing"),
+                    3,
                     null
             ),
             new RoleDefinition(
@@ -119,9 +154,16 @@ public class CandidateProfileService {
                     null
             ),
             new RoleDefinition(
-                    "Engineering Manager / Tech Lead",
-                    List.of("JAVA", "SPRING", "AWS", "KUBERNETES"),
-                    List.of("led", "managed", "team lead", "mentored", "manager"),
+                    "Tech Lead",
+                    List.of("JAVA", "SPRING", "AWS", "KUBERNETES", "CI/CD"),
+                    List.of("tech lead", "team lead", "lead engineer", "lead developer", "architect", "architecture", "mentored", "led team"),
+                    3,
+                    6
+            ),
+            new RoleDefinition(
+                    "Engineering Manager",
+                    List.of("JAVA", "SPRING", "AWS", "KUBERNETES", "CI/CD"),
+                    List.of("engineering manager", "people manager", "line manager", "managed team", "hiring", "performance review", "director"),
                     3,
                     8
             )
@@ -131,6 +173,12 @@ public class CandidateProfileService {
     private static final Pattern LOCATION_PATTERN = Pattern.compile("(?:location|based in)\\s*[:\\-]\\s*([^\\n,;]+(?:,\\s*[^\\n,;]+)?)", Pattern.CASE_INSENSITIVE);
     private static final Pattern CITY_STATE_PATTERN = Pattern.compile("([A-Z][a-z]+(?:[\\s\\-'][A-Z][a-z]+)*,\\s*([A-Z]{2}))");
     private static final Pattern NAME_TOKEN_PATTERN = Pattern.compile("^[\\p{L}][\\p{L}.\\-']*$");
+    private static final Pattern NAME_SEGMENT_SPLIT_PATTERN = Pattern.compile("\\s(?:\\||•|·|—|–|:)\\s|\\s+-\\s");
+    private static final Pattern NAME_WITH_ROLE_SUFFIX_PATTERN = Pattern.compile(
+            "^([\\p{L}][\\p{L}.\\-']*(?:\\s+[\\p{L}][\\p{L}.\\-']*){1,3})\\s+"
+                    + "(?:senior|junior|principal|lead|staff|software|qa|sdet|devops|backend|frontend|full[- ]?stack|"
+                    + "engineering|engineer|developer|manager|architect)\\b.*$",
+            Pattern.CASE_INSENSITIVE);
     private static final Pattern EMAIL_PATTERN = Pattern.compile("([A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,})", Pattern.CASE_INSENSITIVE);
     private static final Pattern PHONE_PATTERN = Pattern.compile("(\\+?\\d[\\d\\s().\\-]{7,}\\d)");
     private static final Pattern URL_PATTERN = Pattern.compile("((?:https?://)?(?:www\\.)?(?:linkedin\\.com|github\\.com)/[^\\s)]+)", Pattern.CASE_INSENSITIVE);
@@ -247,6 +295,12 @@ public class CandidateProfileService {
         return Optional.ofNullable(candidatesById.get(id));
     }
 
+    public List<CandidateProfile> allCandidates() {
+        return candidatesById.values().stream()
+                .sorted(Comparator.comparing(CandidateProfile::displayName, String.CASE_INSENSITIVE_ORDER))
+                .toList();
+    }
+
     public CandidateSearchResponse search(
             String search,
             String skill,
@@ -319,7 +373,16 @@ public class CandidateProfileService {
                     fileSize,
                     modifiedAt,
                     now,
-                    preview
+                    preview,
+                    List.of(toVersionSnapshot(
+                            sourceFilename,
+                            now,
+                            skills,
+                            significantSkills,
+                            suggestedRoles,
+                            years,
+                            location,
+                            preview))
             );
         }
 
@@ -328,6 +391,21 @@ public class CandidateProfileService {
 
         Set<String> mergedSkills = new LinkedHashSet<>(existing.skills());
         mergedSkills.addAll(skills);
+
+        List<CandidateProfileVersion> versions = new ArrayList<>();
+        versions.add(toVersionSnapshot(
+                sourceFilename,
+                now,
+                skills,
+                significantSkills,
+                suggestedRoles,
+                years,
+                location,
+                preview));
+        versions.addAll(existing.versions() != null ? existing.versions() : List.of());
+        if (versions.size() > VERSION_HISTORY_LIMIT) {
+            versions = versions.subList(0, VERSION_HISTORY_LIMIT);
+        }
 
         return new CandidateProfile(
                 existing.id(),
@@ -347,7 +425,29 @@ public class CandidateProfileService {
                 Math.max(existing.fileSizeBytes(), fileSize),
                 chooseLatest(existing.fileLastModifiedAt(), modifiedAt),
                 now,
-                chooseLonger(existing.preview(), preview)
+                chooseLonger(existing.preview(), preview),
+                List.copyOf(versions)
+        );
+    }
+
+    private static CandidateProfileVersion toVersionSnapshot(
+            String sourceFilename,
+            Instant ingestedAt,
+            List<String> skills,
+            List<String> significantSkills,
+            List<String> suggestedRoles,
+            Integer years,
+            String location,
+            String preview) {
+        return new CandidateProfileVersion(
+                sourceFilename,
+                ingestedAt,
+                skills != null ? List.copyOf(skills) : List.of(),
+                significantSkills != null ? List.copyOf(significantSkills) : List.of(),
+                suggestedRoles != null ? List.copyOf(suggestedRoles) : List.of(),
+                years,
+                location != null ? location : "",
+                preview != null ? preview : ""
         );
     }
 
@@ -464,14 +564,16 @@ public class CandidateProfileService {
         String bestName = "";
         double bestScore = Double.NEGATIVE_INFINITY;
         for (int i = 0; i < candidateLines.size(); i++) {
-            String candidate = normalizeCandidateName(candidateLines.get(i));
-            if (candidate.isBlank()) {
-                continue;
-            }
-            double score = scoreNameCandidate(candidate, i);
-            if (score > bestScore) {
-                bestScore = score;
-                bestName = candidate;
+            for (String lineVariant : expandCandidateLineVariants(candidateLines.get(i))) {
+                String candidate = normalizeCandidateName(lineVariant);
+                if (candidate.isBlank()) {
+                    continue;
+                }
+                double score = scoreNameCandidate(candidate, i);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestName = candidate;
+                }
             }
         }
 
@@ -479,7 +581,36 @@ public class CandidateProfileService {
             return bestName;
         }
 
+        String fromEmail = nameFromEmail(text);
+        if (!fromEmail.isBlank()) {
+            return fromEmail;
+        }
+
         return nameFromFilename(filename);
+    }
+
+    private static List<String> expandCandidateLineVariants(String line) {
+        if (line == null || line.isBlank()) {
+            return List.of();
+        }
+        String trimmed = line.trim();
+        LinkedHashSet<String> variants = new LinkedHashSet<>();
+        variants.add(trimmed);
+
+        String lower = trimmed.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("name:")) {
+            variants.add(trimmed.substring(5).trim());
+        } else if (lower.startsWith("name -")) {
+            variants.add(trimmed.substring(6).trim());
+        }
+
+        for (String segment : NAME_SEGMENT_SPLIT_PATTERN.split(trimmed)) {
+            String compact = segment.trim();
+            if (!compact.isBlank()) {
+                variants.add(compact);
+            }
+        }
+        return variants.stream().toList();
     }
 
     private static String normalizeCandidateName(String line) {
@@ -490,25 +621,36 @@ public class CandidateProfileService {
         if (compact.isBlank() || compact.length() > 80) {
             return "";
         }
+        compact = stripRoleSuffixFromNameLine(compact);
         if (compact.contains("@") || compact.matches(".*\\d.*") || compact.toLowerCase(Locale.ROOT).contains("http")) {
             return "";
         }
+        if (looksLikeLocationPhrase(compact)) {
+            return "";
+        }
 
-        List<String> lineWords = Arrays.stream(compact.toLowerCase(Locale.ROOT).split("[^a-zA-Z]+"))
+        List<String> lineWords = Arrays.stream(compact.toLowerCase(Locale.ROOT).split("[^\\p{L}]+"))
                 .filter(word -> !word.isBlank())
                 .toList();
         if (lineWords.stream().anyMatch(NAME_BLOCKLIST::contains)) {
             return "";
         }
+        if (lineWords.stream().anyMatch(NAME_ROLE_NOISE::contains)) {
+            return "";
+        }
 
-        String[] rawTokens = compact.replace(',', ' ').replace(';', ' ').split("\\s+");
-        if (rawTokens.length < 2 || rawTokens.length > 5) {
+        List<String> rawTokens = Arrays.stream(compact.replace(',', ' ').replace(';', ' ').split("\\s+"))
+                .filter(token -> !token.isBlank())
+                .toList();
+        List<String> normalizedRawTokens = collapseSingleLetterRuns(rawTokens);
+        String[] normalizedTokensArray = normalizedRawTokens.toArray(new String[0]);
+        if (normalizedTokensArray.length < 2 || normalizedTokensArray.length > 6) {
             return "";
         }
 
         List<String> normalizedTokens = new ArrayList<>();
-        for (int i = 0; i < rawTokens.length; i++) {
-            String token = rawTokens[i].replaceAll("^[^\\p{L}]+|[^\\p{L}.\\-']+$", "");
+        for (int i = 0; i < normalizedTokensArray.length; i++) {
+            String token = normalizedTokensArray[i].replaceAll("^[^\\p{L}]+|[^\\p{L}.\\-']+$", "");
             if (token.isBlank() || !NAME_TOKEN_PATTERN.matcher(token).matches()) {
                 return "";
             }
@@ -521,6 +663,44 @@ public class CandidateProfileService {
         }
 
         return String.join(" ", normalizedTokens).trim();
+    }
+
+    private static String stripRoleSuffixFromNameLine(String line) {
+        if (line == null || line.isBlank()) {
+            return "";
+        }
+        Matcher matcher = NAME_WITH_ROLE_SUFFIX_PATTERN.matcher(line.trim());
+        if (!matcher.matches()) {
+            return line.trim();
+        }
+        return matcher.group(1).trim();
+    }
+
+    private static List<String> collapseSingleLetterRuns(List<String> tokens) {
+        List<String> collapsed = new ArrayList<>();
+        StringBuilder letterRun = new StringBuilder();
+        for (String rawToken : tokens) {
+            String token = rawToken.replaceAll("^[^\\p{L}]+|[^\\p{L}.\\-']+$", "");
+            if (token.length() == 1 && Character.isLetter(token.charAt(0))) {
+                letterRun.append(token);
+                continue;
+            }
+            flushLetterRun(collapsed, letterRun);
+            if (!token.isBlank()) {
+                collapsed.add(token);
+            }
+        }
+        flushLetterRun(collapsed, letterRun);
+        return collapsed;
+    }
+
+    private static void flushLetterRun(List<String> target, StringBuilder letterRun) {
+        if (letterRun.length() >= 2) {
+            target.add(letterRun.toString());
+        } else if (letterRun.length() == 1) {
+            target.add(letterRun.toString() + ".");
+        }
+        letterRun.setLength(0);
     }
 
     private static double scoreNameCandidate(String name, int lineIndex) {
@@ -537,6 +717,9 @@ public class CandidateProfileService {
                 .filter(NAME_PARTICLES::contains)
                 .count();
         score += Math.min(2.0, particleCount);
+        if (looksLikeLocationPhrase(name)) {
+            score -= 20.0;
+        }
         return score;
     }
 
@@ -571,15 +754,85 @@ public class CandidateProfileService {
         String[] tokens = base.replace('_', ' ').replace('-', ' ').trim().split("\\s+");
         List<String> words = new ArrayList<>();
         for (int i = 0; i < tokens.length; i++) {
-            String token = tokens[i].replaceAll("[^a-zA-Z]", "");
+            String token = tokens[i].replaceAll("[^\\p{L}]", "");
             if (token.isBlank()) {
                 continue;
             }
             String lower = token.toLowerCase(Locale.ROOT);
+            if (NAME_BLOCKLIST.contains(lower)
+                    || "email".equals(lower)
+                    || "gmail".equals(lower)
+                    || "yahoo".equals(lower)
+                    || "hotmail".equals(lower)
+                    || "outlook".equals(lower)
+                    || "resume".equals(lower)
+                    || "cv".equals(lower)
+                    || "com".equals(lower)
+                    || "net".equals(lower)
+                    || "org".equals(lower)) {
+                continue;
+            }
             words.add(i > 0 && NAME_PARTICLES.contains(lower) ? lower : titleCaseToken(lower));
         }
         String result = String.join(" ", words).trim();
         return result.isEmpty() ? "Candidate" : result;
+    }
+
+    private static String nameFromEmail(String text) {
+        String email = extractEmail(text);
+        if (email.isBlank()) {
+            return "";
+        }
+        int atIndex = email.indexOf('@');
+        if (atIndex <= 0) {
+            return "";
+        }
+        String local = email.substring(0, atIndex).toLowerCase(Locale.ROOT);
+        String[] rawTokens = local.replaceAll("[^\\p{L}]+", " ").trim().split("\\s+");
+        List<String> tokens = Arrays.stream(rawTokens)
+                .filter(token -> !token.isBlank())
+                .map(token -> token.replaceAll("\\d+", ""))
+                .filter(token -> !token.isBlank())
+                .toList();
+        if (tokens.size() < 2 || tokens.size() > 5) {
+            return "";
+        }
+        List<String> nameTokens = new ArrayList<>();
+        for (int i = 0; i < tokens.size(); i++) {
+            String token = tokens.get(i);
+            if (!NAME_TOKEN_PATTERN.matcher(token).matches()) {
+                return "";
+            }
+            String lower = token.toLowerCase(Locale.ROOT);
+            nameTokens.add(i > 0 && NAME_PARTICLES.contains(lower) ? lower : titleCaseToken(lower));
+        }
+        return String.join(" ", nameTokens).trim();
+    }
+
+    private static boolean looksLikeLocationPhrase(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        String compact = value.trim();
+        String lower = compact.toLowerCase(Locale.ROOT);
+        if (lower.contains("remote") || lower.contains("hybrid") || lower.contains("onsite") || lower.contains("on-site")) {
+            return true;
+        }
+        Matcher cityStateMatcher = CITY_STATE_PATTERN.matcher(compact);
+        if (cityStateMatcher.find()) {
+            String stateCode = cityStateMatcher.group(2).trim().toUpperCase(Locale.ROOT);
+            if (US_STATE_CODES.contains(stateCode)) {
+                return true;
+            }
+        }
+        List<String> words = Arrays.stream(lower.split("[^\\p{L}]+"))
+                .filter(word -> !word.isBlank())
+                .toList();
+        if (words.size() < 2 || words.size() > 5) {
+            return false;
+        }
+        long hints = words.stream().filter(LOCATION_HINT_WORDS::contains).count();
+        return hints >= 2;
     }
 
     private static SkillExtraction extractSkillExtraction(String text) {
@@ -649,8 +902,19 @@ public class CandidateProfileService {
                 score -= 1;
             }
 
-            if (LEADERSHIP_ROLE_TITLE.equals(definition.title())
-                    && !containsAny(lowerText, LEADERSHIP_TRACK_KEYWORDS)) {
+            if (QA_ROLE_TITLE.equals(definition.title())
+                    && skillHits < 2
+                    && !containsAny(lowerText, QA_TRACK_KEYWORDS)) {
+                continue;
+            }
+
+            if (TECH_LEAD_ROLE_TITLE.equals(definition.title())
+                    && !containsAny(lowerText, TECH_LEAD_TRACK_KEYWORDS)) {
+                continue;
+            }
+
+            if (ENGINEERING_MANAGER_ROLE_TITLE.equals(definition.title())
+                    && !containsAny(lowerText, MANAGER_TRACK_KEYWORDS)) {
                 continue;
             }
 

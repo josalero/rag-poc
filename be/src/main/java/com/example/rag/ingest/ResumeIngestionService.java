@@ -2,6 +2,7 @@ package com.example.rag.ingest;
 
 import com.example.rag.audit.IngestAuditService;
 import com.example.rag.candidate.CandidateProfileService;
+import com.example.rag.metrics.ObservabilityService;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.Metadata;
 import dev.langchain4j.data.segment.TextSegment;
@@ -16,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -26,6 +28,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
@@ -44,18 +52,29 @@ public class ResumeIngestionService {
     private final EmbeddingStoreIngestor embeddingStoreIngestor;
     private final CandidateProfileService candidateProfileService;
     private final IngestAuditService ingestAuditService;
+    private final ObservabilityService observabilityService;
+    private final ExecutorService ingestExecutor = Executors.newFixedThreadPool(2);
 
     @Value("${app.resumes.path:./downloaded-resumes}")
     private String resumesPath;
+    @Value("${app.ingest.file-timeout-seconds:60}")
+    private int fileIngestTimeoutSeconds;
 
     public ResumeIngestionService(EmbeddingStore<TextSegment> embeddingStore,
                                   EmbeddingStoreIngestor embeddingStoreIngestor,
                                   CandidateProfileService candidateProfileService,
-                                  IngestAuditService ingestAuditService) {
+                                  IngestAuditService ingestAuditService,
+                                  ObservabilityService observabilityService) {
         this.embeddingStore = embeddingStore;
         this.embeddingStoreIngestor = embeddingStoreIngestor;
         this.candidateProfileService = candidateProfileService;
         this.ingestAuditService = ingestAuditService;
+        this.observabilityService = observabilityService;
+    }
+
+    @PreDestroy
+    public void shutdownExecutor() {
+        ingestExecutor.shutdownNow();
     }
 
     public record UploadResume(String filename, byte[] content) {}
@@ -124,6 +143,7 @@ public class ResumeIngestionService {
 
         log.info("Ingestion from folder completed. Processed: {}, skipped: {}", processed, skipped);
         ingestAuditService.saveRun(auditRun, processed, skipped);
+        observabilityService.recordIngestRun(processed, skipped);
         progress.accept(IngestProgressEvent.done(processed));
         return processed;
     }
@@ -191,6 +211,7 @@ public class ResumeIngestionService {
 
         log.info("Uploaded ingestion completed. Processed: {}, skipped: {}", processed, skipped);
         ingestAuditService.saveRun(auditRun, processed, skipped);
+        observabilityService.recordIngestRun(processed, skipped);
         progress.accept(IngestProgressEvent.done(processed));
         return processed;
     }
@@ -227,7 +248,7 @@ public class ResumeIngestionService {
             meta.put("file_name", filename);
             meta.put("content_hash", contentHash);
             Document doc = Document.from(sanitized, meta);
-            embeddingStoreIngestor.ingest(doc);
+            ingestWithTimeout(doc);
             candidateProfileService.indexResume(filename, sourcePath, sanitized, contentHash);
             log.info("Ingested: {}", filename);
             auditRun.addFileEvent(filename, "ingested", null);
@@ -238,6 +259,26 @@ public class ResumeIngestionService {
             auditRun.addFileEvent(filename, "skipped", e.getMessage());
             progress.accept(IngestProgressEvent.fileSkipped(filename, e.getMessage()));
             return false;
+        }
+    }
+
+    private void ingestWithTimeout(Document doc) throws Exception {
+        int timeoutSeconds = Math.max(1, fileIngestTimeoutSeconds);
+        CompletableFuture<Void> future = CompletableFuture.runAsync(() -> embeddingStoreIngestor.ingest(doc), ingestExecutor);
+        try {
+            future.get(timeoutSeconds, TimeUnit.SECONDS);
+        } catch (TimeoutException timeout) {
+            future.cancel(true);
+            throw new RuntimeException("Embedding request timed out after " + timeoutSeconds + "s", timeout);
+        } catch (ExecutionException execution) {
+            Throwable cause = execution.getCause() != null ? execution.getCause() : execution;
+            if (cause instanceof Exception ex) {
+                throw ex;
+            }
+            throw new RuntimeException(cause);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Ingestion interrupted", interrupted);
         }
     }
 

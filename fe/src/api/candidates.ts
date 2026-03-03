@@ -1,5 +1,16 @@
 const getBaseUrl = () => import.meta.env.VITE_API_URL ?? ''
 
+export interface CandidateProfileVersion {
+  sourceFilename: string
+  ingestedAt: string
+  skills: string[]
+  significantSkills: string[]
+  suggestedRoles: string[]
+  estimatedYearsExperience: number | null
+  location: string
+  preview: string
+}
+
 export interface CandidateProfile {
   id: string
   sourceFilename: string
@@ -19,6 +30,7 @@ export interface CandidateProfile {
   fileLastModifiedAt: string | null
   lastIngestedAt: string | null
   preview: string
+  versions: CandidateProfileVersion[]
 }
 
 export interface CandidateSearchResponse {
@@ -84,4 +96,15 @@ export function resumeViewUrl(sourceFilename: string): string {
 export function resumeDownloadUrl(sourceFilename: string): string {
   const base = getBaseUrl()
   return `${base}/api/resumes/${encodeURIComponent(sourceFilename)}?download=true`
+}
+
+export function candidatesExportCsvUrl(params?: {
+  search?: string
+  skill?: string
+  location?: string
+  sort?: string
+}): string {
+  const base = getBaseUrl()
+  const query = buildQuery(params ?? {})
+  return `${base}/api/export/candidates.csv${query}`
 }

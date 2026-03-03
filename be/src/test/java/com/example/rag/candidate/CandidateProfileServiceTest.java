@@ -25,6 +25,58 @@ class CandidateProfileServiceTest {
     }
 
     @Test
+    void indexResume_extractsNameFromLatexLikeSpacedLetters(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("latex-name.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Alajuela Costa Rica
+                J O S E A D R I A N  A L E M A N  R O J A S
+                Senior Software Engineer
+                jose.adrian.aleman.rojas@example.com
+                """;
+        service.indexResume("latex-name.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("latex-name.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Jose Adrian Aleman Rojas");
+    }
+
+    @Test
+    void indexResume_extractsNameFromStandardHeaderWithRoleSuffix(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("standard-name.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Carlos Ruiz Senior Software Engineer
+                8 years of experience in Java and Spring.
+                carlos.ruiz@example.com
+                """;
+        service.indexResume("standard-name.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("standard-name.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Carlos Ruiz");
+    }
+
+    @Test
+    void indexResume_fallsBackToEmailLocalPartWhenNameLineMissing(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("email-msancho01-gmail-com.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Curriculum Vitae
+                Senior Backend Engineer
+                Contact: martin.sancho.rojas@gmail.com
+                """;
+        service.indexResume("email-msancho01-gmail-com.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("email-msancho01-gmail-com.pdf").orElseThrow();
+        assertThat(profile.displayName()).isEqualTo("Martin Sancho Rojas");
+    }
+
+    @Test
     void indexResume_buildsSummaryStylePreview(@TempDir Path tempDir) throws IOException {
         CandidateProfileService service = new CandidateProfileService();
         Path resume = tempDir.resolve("alice-jones.pdf");
@@ -103,8 +155,66 @@ class CandidateProfileServiceTest {
 
         CandidateProfile profile = service.getBySourceFilename("backend-platform.pdf").orElseThrow();
         assertThat(profile.significantSkills()).contains("JAVA", "SPRING", "AWS", "DOCKER", "KUBERNETES", "CI/CD");
-        assertThat(profile.suggestedRoles()).contains("Senior Backend Engineer", "Senior DevOps / Platform Engineer");
-        assertThat(profile.suggestedRoles()).hasSizeLessThanOrEqualTo(2);
+        assertThat(profile.suggestedRoles()).contains("Senior Tech Lead", "Senior DevOps / Platform Engineer");
+        assertThat(profile.suggestedRoles()).hasSizeLessThanOrEqualTo(3);
+    }
+
+    @Test
+    void indexResume_identifiesQaTesterProfile(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("qa-profile.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Sofia Martinez
+                Senior QA Engineer with 7 years of experience in quality assurance.
+                Built test automation frameworks with Selenium and Cypress.
+                Executed API testing with Postman and wrote regression test cases.
+                """;
+
+        service.indexResume("qa-profile.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("qa-profile.pdf").orElseThrow();
+        assertThat(profile.significantSkills()).contains("QA", "TESTING", "SELENIUM", "CYPRESS", "POSTMAN");
+        assertThat(profile.suggestedRoles()).contains("Senior QA / Test Engineer");
+    }
+
+    @Test
+    void indexResume_identifiesTechLeadProfile(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("tech-lead.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Diego Alvarez
+                Senior software engineer with 9 years of experience in Java and Spring.
+                Worked as tech lead, led team delivery, drove architecture decisions, and mentored developers.
+                Built services on AWS and Kubernetes.
+                """;
+
+        service.indexResume("tech-lead.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("tech-lead.pdf").orElseThrow();
+        assertThat(profile.suggestedRoles()).contains("Senior Tech Lead");
+    }
+
+    @Test
+    void indexResume_identifiesEngineeringManagerProfile(@TempDir Path tempDir) throws IOException {
+        CandidateProfileService service = new CandidateProfileService();
+        Path resume = tempDir.resolve("eng-manager.pdf");
+        Files.writeString(resume, "fake pdf bytes");
+
+        String text = """
+                Laura Diaz
+                Engineering manager with 11 years of experience in software delivery.
+                Managed team planning, hiring, and performance reviews for backend squads.
+                Collaborated with product and led roadmap execution across services.
+                """;
+
+        service.indexResume("eng-manager.pdf", resume, text);
+
+        CandidateProfile profile = service.getBySourceFilename("eng-manager.pdf").orElseThrow();
+        assertThat(profile.suggestedRoles()).contains("Senior Engineering Manager");
     }
 
     @Test

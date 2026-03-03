@@ -22,9 +22,11 @@ public class IngestController {
     private static final long STREAM_TIMEOUT_MS = 300_000L;
 
     private final ResumeIngestionService resumeIngestionService;
+    private final IngestJobService ingestJobService;
 
-    public IngestController(ResumeIngestionService resumeIngestionService) {
+    public IngestController(ResumeIngestionService resumeIngestionService, IngestJobService ingestJobService) {
         this.resumeIngestionService = resumeIngestionService;
+        this.ingestJobService = ingestJobService;
     }
 
     @PostMapping("/ingest")
@@ -87,5 +89,30 @@ public class IngestController {
             }
         });
         return emitter;
+    }
+
+    @PostMapping("/ingest/jobs/folder")
+    public ResponseEntity<IngestJobStatus> startFolderIngestJob() {
+        return ResponseEntity.ok(ingestJobService.startFolderJob());
+    }
+
+    @PostMapping("/ingest/jobs")
+    public ResponseEntity<IngestJobStatus> startDefaultJob() {
+        return ResponseEntity.ok(ingestJobService.startFolderJob());
+    }
+
+    @org.springframework.web.bind.annotation.GetMapping("/ingest/jobs")
+    public ResponseEntity<List<IngestJobStatus>> listJobs(
+            @RequestParam(defaultValue = "30") int limit) {
+        return ResponseEntity.ok(ingestJobService.listJobs(limit));
+    }
+
+    @org.springframework.web.bind.annotation.GetMapping("/ingest/jobs/{id}")
+    public ResponseEntity<IngestJobStatus> getJob(@org.springframework.web.bind.annotation.PathVariable String id) {
+        IngestJobStatus status = ingestJobService.getJob(id);
+        if (status == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(status);
     }
 }

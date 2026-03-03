@@ -40,9 +40,18 @@ class SkillsQueryControllerTest {
 
     @Test
     void query_withValidQuestion_returnsOkAndAnswer() throws Exception {
-        when(ragService.query(anyString(), any(), any(), any(), any())).thenReturn(QueryResponse.of(
+        when(ragService.query(anyString(), any(), any(), any(), any(), any())).thenReturn(QueryResponse.of(
                 "Test answer.",
-                List.of(new QueryResponse.SourceSegment("Excerpt from resume.", "resume1.pdf", 0.93, 1, "resume1"))));
+                List.of(new QueryResponse.SourceSegment(
+                        "Excerpt from resume.",
+                        "resume1.pdf",
+                        0.93,
+                        1,
+                        "resume1",
+                        0.93,
+                        0.5,
+                        List.of("java"),
+                        List.of("spring")))));
 
         mockMvc.perform(post("/api/query")
                         .contentType(MediaType.APPLICATION_JSON)

@@ -56,7 +56,9 @@ class RagServiceTest {
         assertThat(response.answer()).isEqualTo("John has Java experience.");
         assertThat(response.sources()).hasSize(1);
         assertThat(response.sources().get(0).text()).contains("Java");
-        assertThat(response.sources().get(0).score()).isEqualTo(0.9);
+        assertThat(response.sources().get(0).score()).isCloseTo(0.92, org.assertj.core.data.Offset.offset(0.0001));
+        assertThat(response.sources().get(0).vectorScore()).isEqualTo(0.9);
+        assertThat(response.sources().get(0).keywordScore()).isGreaterThan(0.0);
         verify(chatModel).chat(org.mockito.ArgumentMatchers.argThat(
                 (String s) -> s != null && s.contains("John has Java") && s.contains("Who has Java experience?")));
     }
@@ -141,12 +143,13 @@ class RagServiceTest {
         when(embeddingStore.search(any())).thenReturn(searchResult);
         when(chatModel.chat(anyString())).thenReturn("Alice and Bob match the query.");
 
-        QueryResponse response = ragService.query("Who has backend and platform skills?");
+        QueryResponse response = ragService.query("Who has backend and platform skills?", 50, 0.0, 1, 10, false);
 
         assertThat(response.sources()).hasSize(2);
         assertThat(response.totalSources()).isEqualTo(2);
         assertThat(response.sources().get(0).source()).isEqualTo("alice.pdf");
-        assertThat(response.sources().get(0).score()).isEqualTo(0.95);
+        assertThat(response.sources().get(0).score()).isGreaterThan(0.8);
+        assertThat(response.sources().get(0).vectorScore()).isEqualTo(0.95);
         assertThat(response.sources().get(1).source()).isEqualTo("bob.pdf");
     }
 }

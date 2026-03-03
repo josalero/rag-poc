@@ -6,6 +6,16 @@ export interface SourceSegment {
   score: number
   rank: number
   candidateId: string
+  vectorScore: number
+  keywordScore: number
+  matchedTerms: string[]
+  missingTerms: string[]
+}
+
+export interface QueryExplainability {
+  matchedTerms: string[]
+  missingTerms: string[]
+  confidenceScore: number
 }
 
 export interface QueryResponse {
@@ -14,6 +24,7 @@ export interface QueryResponse {
   page: number
   pageSize: number
   totalSources: number
+  explainability: QueryExplainability
 }
 
 export interface QueryOptions {
@@ -21,6 +32,7 @@ export interface QueryOptions {
   minScore?: number
   page?: number
   pageSize?: number
+  useFeedbackTuning?: boolean
 }
 
 export async function querySkills(question: string, options?: QueryOptions): Promise<QueryResponse> {
@@ -31,6 +43,7 @@ export async function querySkills(question: string, options?: QueryOptions): Pro
     minScore?: number
     page?: number
     pageSize?: number
+    useFeedbackTuning?: boolean
   } = { question }
   if (options?.maxResults !== undefined) {
     body.maxResults = options.maxResults
@@ -43,6 +56,9 @@ export async function querySkills(question: string, options?: QueryOptions): Pro
   }
   if (options?.pageSize !== undefined) {
     body.pageSize = options.pageSize
+  }
+  if (options?.useFeedbackTuning !== undefined) {
+    body.useFeedbackTuning = options.useFeedbackTuning
   }
   const res = await fetch(`${base}/api/query`, {
     method: 'POST',

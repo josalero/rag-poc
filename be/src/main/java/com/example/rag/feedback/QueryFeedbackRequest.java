@@ -6,6 +6,8 @@ public record QueryFeedbackRequest(
         @NotBlank String question,
         @NotBlank String answer,
         boolean helpful,
-        String notes
+        String notes,
+        Double minScoreUsed,
+        Double avgSourceScore
 ) {
 }

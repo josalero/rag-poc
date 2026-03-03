@@ -21,6 +21,7 @@ public record CandidateProfile(
         long fileSizeBytes,
         Instant fileLastModifiedAt,
         Instant lastIngestedAt,
-        String preview
+        String preview,
+        List<CandidateProfileVersion> versions
 ) {
 }

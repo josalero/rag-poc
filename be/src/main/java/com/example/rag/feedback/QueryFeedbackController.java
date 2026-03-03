@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/query/feedback")
@@ -35,5 +36,14 @@ public class QueryFeedbackController {
     public ResponseEntity<List<QueryFeedbackEntry>> getRecent(
             @RequestParam(defaultValue = "20") int limit) {
         return ResponseEntity.ok(queryFeedbackService.recent(limit));
+    }
+
+    @GetMapping("/recommendation")
+    public ResponseEntity<Map<String, Object>> recommendation(
+            @RequestParam(defaultValue = "0.75") double baseline) {
+        return ResponseEntity.ok(Map.of(
+                "baseline", baseline,
+                "recommendedMinScore", queryFeedbackService.recommendMinScore(baseline)
+        ));
     }
 }

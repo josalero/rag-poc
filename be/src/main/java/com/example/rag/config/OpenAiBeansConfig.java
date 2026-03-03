@@ -39,7 +39,10 @@ public class OpenAiBeansConfig {
     EmbeddingModel embeddingModel(
             @Value("${langchain4j.open-ai.embedding-model.api-key:}") String apiKey,
             @Value("${langchain4j.open-ai.embedding-model.base-url:}") String baseUrl,
-            @Value("${langchain4j.open-ai.embedding-model.model-name:text-embedding-3-small}") String modelName) {
+            @Value("${langchain4j.open-ai.embedding-model.model-name:text-embedding-3-small}") String modelName,
+            @Value("${langchain4j.open-ai.embedding-model.timeout-seconds:45}") int timeoutSeconds,
+            @Value("${langchain4j.open-ai.embedding-model.max-retries:0}") int maxRetries,
+            @Value("${langchain4j.open-ai.embedding-model.max-segments-per-batch:8}") int maxSegmentsPerBatch) {
         String key = apiKey != null ? apiKey.trim() : "";
         if (key.isEmpty()) {
             throw new IllegalStateException(
@@ -47,7 +50,10 @@ public class OpenAiBeansConfig {
         }
         var builder = OpenAiEmbeddingModel.builder()
                 .apiKey(key)
-                .modelName(modelName != null && !modelName.isBlank() ? modelName.trim() : "text-embedding-3-small");
+                .modelName(modelName != null && !modelName.isBlank() ? modelName.trim() : "text-embedding-3-small")
+                .timeout(Duration.ofSeconds(Math.max(5, timeoutSeconds)))
+                .maxRetries(Math.max(0, maxRetries))
+                .maxSegmentsPerBatch(Math.max(1, maxSegmentsPerBatch));
         if (baseUrl != null && !baseUrl.isBlank()) {
             builder.baseUrl(baseUrl.trim());
         }

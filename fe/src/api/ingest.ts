@@ -16,6 +16,17 @@ export interface IngestProgressEvent {
   documentsProcessed?: number
 }
 
+export interface IngestJobStatus {
+  id: string
+  type: string
+  status: 'queued' | 'running' | 'completed' | 'failed'
+  processed: number
+  skipped: number
+  startedAt: string
+  finishedAt?: string | null
+  message?: string
+}
+
 async function parseError(res: Response): Promise<Error> {
   const payload = await res.text().catch(() => '')
   let message = payload || `Request failed: ${res.status}`
@@ -37,6 +48,27 @@ export async function triggerIngest(): Promise<IngestResponse> {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
   })
+  if (!res.ok) {
+    throw await parseError(res)
+  }
+  return res.json()
+}
+
+export async function startIngestJob(): Promise<IngestJobStatus> {
+  const base = getBaseUrl()
+  const res = await fetch(`${base}/api/ingest/jobs/folder`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+  })
+  if (!res.ok) {
+    throw await parseError(res)
+  }
+  return res.json()
+}
+
+export async function listIngestJobs(limit = 30): Promise<IngestJobStatus[]> {
+  const base = getBaseUrl()
+  const res = await fetch(`${base}/api/ingest/jobs?limit=${encodeURIComponent(String(limit))}`)
   if (!res.ok) {
     throw await parseError(res)
   }

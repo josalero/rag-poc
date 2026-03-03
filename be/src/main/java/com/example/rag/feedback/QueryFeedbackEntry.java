@@ -7,6 +7,8 @@ public record QueryFeedbackEntry(
         String answer,
         boolean helpful,
         String notes,
+        Double minScoreUsed,
+        Double avgSourceScore,
         Instant createdAt
 ) {
 }

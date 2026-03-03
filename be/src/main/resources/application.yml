@@ -28,6 +28,9 @@ langchain4j:
       base-url: ${OPENROUTER_EMBEDDING_BASE_URL:https://openrouter.ai/api/v1}
       api-key: ${OPENROUTER_API_KEY}
       model-name: ${OPENROUTER_EMBEDDING_MODEL:openai/text-embedding-3-small}
+      timeout-seconds: ${OPENROUTER_EMBEDDING_TIMEOUT_SECONDS:45}
+      max-retries: ${OPENROUTER_EMBEDDING_MAX_RETRIES:0}
+      max-segments-per-batch: ${OPENROUTER_EMBEDDING_MAX_SEGMENTS_PER_BATCH:8}
 
 app:
   store:
@@ -39,9 +42,15 @@ app:
     no-results-answer: ${RAG_NO_RESULTS_ANSWER:I couldn't find relevant information in the ingested resumes.}
   resumes:
     path: ${RESUMES_PATH:./downloaded-resumes}
+  ingest:
+    file-timeout-seconds: ${INGEST_FILE_TIMEOUT_SECONDS:60}
   pgvector:
     table: document_embeddings
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
 server:
   port: 8084
+
+logging:
+  level:
+    dev.langchain4j.internal.RetryUtils: ERROR

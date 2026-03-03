@@ -13,6 +13,7 @@ import {
   InputNumber,
   Layout,
   List,
+  Modal,
   Pagination,
   Row,
   Select,
@@ -29,24 +30,32 @@ import {
   DislikeOutlined,
   DownloadOutlined,
   EyeOutlined,
+  FileExcelOutlined,
   LikeOutlined,
+  RocketOutlined,
   ReloadOutlined,
   SaveOutlined,
   SearchOutlined,
+  SendOutlined,
   SwapOutlined,
   UserOutlined,
 } from '@ant-design/icons'
 import { querySkills, type QueryResponse, type SourceSegment } from './api/query'
-import { triggerIngestStream, triggerIngestUpload, type IngestProgressEvent } from './api/ingest'
+import { listIngestJobs, startIngestJob, triggerIngestStream, triggerIngestUpload, type IngestJobStatus, type IngestProgressEvent } from './api/ingest'
 import {
+  candidatesExportCsvUrl,
   fetchCandidates,
   fetchCandidate,
   resumeDownloadUrl,
   resumeViewUrl,
   type CandidateProfile,
 } from './api/candidates'
-import { fetchFeedbackStats, submitQueryFeedback, type FeedbackStats } from './api/feedback'
+import { fetchFeedbackStats, fetchRecommendedMinScore, submitQueryFeedback, type FeedbackStats } from './api/feedback'
 import { fetchIngestAudit, type IngestAuditRun } from './api/audit'
+import { pushToAts } from './api/integrations'
+import { matchCandidates, type JobMatchResponse } from './api/match'
+import { runEval, type EvalRunResponse } from './api/eval'
+import { fetchMetricsSummary, type MetricsSummary } from './api/metrics'
 
 const { Header, Content } = Layout
 const { Text, Paragraph } = Typography
@@ -57,6 +66,8 @@ const DEFAULT_QUERY_PAGE_SIZE = 10
 const GLASS_CARD_CLASS = 'rounded-2xl border border-slate-200 bg-white shadow-sm'
 const MAX_UPLOAD_BATCH_BYTES = 25 * 1024 * 1024
 const MAX_UPLOAD_BATCH_FILES = 10
+const TAB_KEYS = ['ingest', 'query', 'match', 'candidates', 'compare', 'audit', 'eval'] as const
+type TabKey = typeof TAB_KEYS[number]
 
 type StructuredAnswer = {
   answer: string
@@ -78,6 +89,32 @@ type SavedQuery = {
   maxResults: number
   minScore: number
   createdAt: string
+}
+
+function parseTabRouteFromHash(hashValue: string): { tab: TabKey; candidateId?: string } {
+  const hash = (hashValue || '').trim()
+  if (!hash.startsWith('#/')) {
+    return { tab: 'query' }
+  }
+  const raw = hash.slice(2)
+  const [routePart, queryPart = ''] = raw.split('?')
+  const route = routePart.trim().toLowerCase()
+  const isKnownTab = TAB_KEYS.some((key) => key === route)
+  const tab: TabKey = isKnownTab ? route as TabKey : 'query'
+  if (tab !== 'candidates' || !queryPart) {
+    return { tab }
+  }
+  const params = new URLSearchParams(queryPart)
+  const candidateId = params.get('candidate')?.trim()
+  return { tab, candidateId: candidateId || undefined }
+}
+
+function buildHashForTab(tab: TabKey, candidateId?: string): string {
+  if (tab === 'candidates' && candidateId) {
+    const params = new URLSearchParams({ candidate: candidateId })
+    return `#/${tab}?${params.toString()}`
+  }
+  return `#/${tab}`
 }
 
 function scoreTagColor(score: number): string {
@@ -202,7 +239,13 @@ function chunkItems<T>(items: T[], chunkSize: number): T[][] {
   return chunks
 }
 
-function CandidateInfoCard({ candidate }: { candidate: CandidateProfile | null }) {
+function CandidateInfoCard({
+  candidate,
+  onAtsPush,
+}: {
+  candidate: CandidateProfile | null
+  onAtsPush?: (candidateId: string) => void
+}) {
   if (!candidate) {
     return (
       <Card className={GLASS_CARD_CLASS}>
@@ -229,6 +272,11 @@ function CandidateInfoCard({ candidate }: { candidate: CandidateProfile | null }
             <Button size="small" icon={<DownloadOutlined />} href={resumeDownloadUrl(candidate.sourceFilename)}>
               Download PDF
             </Button>
+            {onAtsPush && (
+              <Button size="small" icon={<SendOutlined />} onClick={() => onAtsPush(candidate.id)}>
+                Send To ATS
+              </Button>
+            )}
           </Space>
           <Tag color="cyan">Merged files: {candidate.sourceFilenames?.length ?? 1}</Tag>
         </div>
@@ -312,9 +360,29 @@ function CandidateInfoCard({ candidate }: { candidate: CandidateProfile | null }
           <div className="flex flex-wrap gap-2">
             {(candidate.suggestedRoles?.length ?? 0) === 0
               ? <Text type="secondary">No role suggestions yet</Text>
-              : candidate.suggestedRoles.slice(0, 2).map((role) => <Tag color="geekblue" key={role}>{role}</Tag>)}
+              : candidate.suggestedRoles.slice(0, 3).map((role) => <Tag color="geekblue" key={role}>{role}</Tag>)}
           </div>
         </div>
+
+        <Card size="small" className="rounded-xl border border-slate-100 bg-slate-50">
+          <Text strong>Version History</Text>
+          <List
+            size="small"
+            className="mt-2"
+            dataSource={(candidate.versions ?? []).slice(0, 6)}
+            locale={{ emptyText: 'No version history yet' }}
+            renderItem={(version, index) => (
+              <List.Item key={`${version.sourceFilename}-${version.ingestedAt}-${index}`}>
+                <Space direction="vertical" size={0} className="w-full">
+                  <Text strong>{version.sourceFilename}</Text>
+                  <Text type="secondary">
+                    {formatDate(version.ingestedAt)} · Skills: {version.significantSkills?.slice(0, 3).join(', ') || '-'}
+                  </Text>
+                </Space>
+              </List.Item>
+            )}
+          />
+        </Card>
       </Space>
     </Card>
   )
@@ -327,6 +395,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
   const [activeQuestion, setActiveQuestion] = useState('')
   const [maxResults, setMaxResults] = useState(60)
   const [minScore, setMinScore] = useState(0.75)
+  const [useFeedbackTuning, setUseFeedbackTuning] = useState(true)
   const [result, setResult] = useState<QueryResponse | null>(null)
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([])
   const [candidateNameById, setCandidateNameById] = useState<Record<string, string>>({})
@@ -426,6 +495,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
         minScore: effectiveMinScore,
         page: params.page,
         pageSize: params.pageSize,
+        useFeedbackTuning,
       })
       setResult(data)
       setActiveQuestion(params.q.trim())
@@ -459,6 +529,10 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
         answer: result.answer,
         helpful,
         notes: feedbackNotes,
+        minScoreUsed: minScore,
+        avgSourceScore: result.sources.length > 0
+          ? result.sources.reduce((sum, source) => sum + source.score, 0) / result.sources.length
+          : undefined,
       })
       const stats = await fetchFeedbackStats()
       setFeedbackStats(stats)
@@ -698,8 +772,25 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 onChange={(value) => setMinScore(value ?? 0)}
                 className="mt-2 w-full"
               />
+              <Button
+                className="mt-2 w-full"
+                onClick={() => {
+                  void fetchRecommendedMinScore(minScore).then((recommended) => {
+                    setMinScore(Number(recommended.toFixed(2)))
+                  }).catch(() => {
+                    // best effort only
+                  })
+                }}
+              >
+                Use feedback recommendation
+              </Button>
             </Col>
           </Row>
+          <Space wrap>
+            <Button type={useFeedbackTuning ? 'primary' : 'default'} onClick={() => setUseFeedbackTuning((prev) => !prev)}>
+              Feedback Tuning: {useFeedbackTuning ? 'On' : 'Off'}
+            </Button>
+          </Space>
 
           {savedQueries.length > 0 && (
             <div>
@@ -795,9 +886,14 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 </Space>
               </Space>
               {feedbackStats && (
-                <Tag className="mt-3" color="processing">
-                  Helpful rate: {feedbackStats.helpfulRate.toFixed(1)}% ({feedbackStats.helpful}/{feedbackStats.total})
-                </Tag>
+                <Space wrap className="mt-3">
+                  <Tag color="processing">
+                    Helpful rate: {feedbackStats.helpfulRate.toFixed(1)}% ({feedbackStats.helpful}/{feedbackStats.total})
+                  </Tag>
+                  <Tag color="blue">
+                    Recommended min score: {feedbackStats.recommendedMinScore.toFixed(2)}
+                  </Tag>
+                </Space>
               )}
             </Card>
           </Col>
@@ -814,6 +910,29 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 <Paragraph type="secondary" className="mb-0 mt-3">
                   Page scores: avg {scoreStats.avg.toFixed(3)}, min {scoreStats.min.toFixed(3)}, max {scoreStats.max.toFixed(3)}.
                 </Paragraph>
+              )}
+              {result.explainability && (
+                <Space direction="vertical" size={8} className="mt-3 w-full">
+                  <Tag color={scoreTagColor(result.explainability.confidenceScore)}>
+                    Confidence: {result.explainability.confidenceScore.toFixed(3)}
+                  </Tag>
+                  <div>
+                    <Text strong>Matched terms</Text>
+                    <div className="mt-1 flex flex-wrap gap-2">
+                      {(result.explainability.matchedTerms ?? []).length > 0
+                        ? result.explainability.matchedTerms.map((term) => <Tag color="green" key={`m-${term}`}>{term}</Tag>)
+                        : <Text type="secondary">-</Text>}
+                    </div>
+                  </div>
+                  <div>
+                    <Text strong>Missing terms</Text>
+                    <div className="mt-1 flex flex-wrap gap-2">
+                      {(result.explainability.missingTerms ?? []).length > 0
+                        ? result.explainability.missingTerms.map((term) => <Tag color="orange" key={`x-${term}`}>{term}</Tag>)
+                        : <Text type="secondary">-</Text>}
+                    </div>
+                  </div>
+                </Space>
               )}
             </Card>
           </Col>
@@ -839,8 +958,10 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
 
 function CandidatesTab({
   selectedCandidateId,
+  isActive,
 }: {
   selectedCandidateId?: string
+  isActive: boolean
 }) {
   const screens = useBreakpoint()
   const isMobile = !screens.md
@@ -851,9 +972,12 @@ function CandidatesTab({
   const [pageSize, setPageSize] = useState(12)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [atsMessage, setAtsMessage] = useState<string | null>(null)
   const [items, setItems] = useState<CandidateProfile[]>([])
   const [total, setTotal] = useState(0)
   const [selected, setSelected] = useState<CandidateProfile | null>(null)
+  const [profileOpen, setProfileOpen] = useState(false)
+  const [profileLoading, setProfileLoading] = useState(false)
 
   async function loadCandidates() {
     setLoading(true)
@@ -862,9 +986,6 @@ function CandidatesTab({
       const data = await fetchCandidates({ search, skill, sort, page, pageSize })
       setItems(data.items)
       setTotal(data.total)
-      if (!selected && data.items.length > 0) {
-        setSelected(data.items[0])
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load candidates')
     } finally {
@@ -877,13 +998,58 @@ function CandidatesTab({
   }, [page, pageSize, sort])
 
   useEffect(() => {
+    if (!isActive) return
+    void loadCandidates()
+  }, [isActive])
+
+  useEffect(() => {
+    if (!isActive) return
+    const interval = window.setInterval(() => {
+      void loadCandidates()
+    }, 5000)
+    return () => {
+      window.clearInterval(interval)
+    }
+  }, [isActive, page, pageSize, sort, search, skill])
+
+  useEffect(() => {
     if (!selectedCandidateId) return
+    setProfileOpen(true)
+    setProfileLoading(true)
     void fetchCandidate(selectedCandidateId)
-      .then((candidate) => setSelected(candidate))
+      .then((candidate) => {
+        setSelected(candidate)
+      })
       .catch(() => {
-        // ignore lookup errors from stale ids
+        setError('Failed to open candidate profile')
+      })
+      .finally(() => {
+        setProfileLoading(false)
       })
   }, [selectedCandidateId])
+
+  async function handleAtsPush(candidateId: string) {
+    try {
+      const response = await pushToAts({ candidateId })
+      setAtsMessage(`ATS push status: ${response.status}`)
+    } catch (err) {
+      setAtsMessage(err instanceof Error ? err.message : 'Failed to push to ATS')
+    }
+  }
+
+  async function openProfile(candidate: CandidateProfile) {
+    setSelected(candidate)
+    setProfileOpen(true)
+    setProfileLoading(true)
+    try {
+      const fullProfile = await fetchCandidate(candidate.id)
+      setSelected(fullProfile)
+    } catch {
+      setError('Failed to load candidate profile details')
+    } finally {
+      setProfileLoading(false)
+    }
+  }
 
   const candidateColumns = useMemo<TableProps<CandidateProfile>['columns']>(
     () => [
@@ -928,11 +1094,28 @@ function CandidatesTab({
         width: isMobile ? 170 : 210,
         render: (_, candidate) => (
           <Space wrap>
-            {(candidate.suggestedRoles ?? []).slice(0, 2).map((role) => (
+            {(candidate.suggestedRoles ?? []).slice(0, 3).map((role) => (
               <Tag color="geekblue" key={`${candidate.id}-${role}`}>{role}</Tag>
             ))}
             {(candidate.suggestedRoles?.length ?? 0) === 0 && <Text type="secondary">-</Text>}
           </Space>
+        ),
+      },
+      {
+        title: 'Actions',
+        key: 'actions',
+        width: isMobile ? 110 : 130,
+        render: (_, candidate) => (
+          <Button
+            type="link"
+            icon={<EyeOutlined />}
+            onClick={(event) => {
+              event.stopPropagation()
+              void openProfile(candidate)
+            }}
+          >
+            Profile
+          </Button>
         ),
       },
     ],
@@ -944,7 +1127,14 @@ function CandidatesTab({
       <Card
         className={GLASS_CARD_CLASS}
         title="Candidate Directory"
-        extra={<Button icon={<ReloadOutlined />} onClick={() => void loadCandidates()}>Refresh</Button>}
+        extra={(
+          <Space wrap>
+            <Button icon={<FileExcelOutlined />} href={candidatesExportCsvUrl({ search, skill, sort })}>
+              Export CSV
+            </Button>
+            <Button icon={<ReloadOutlined />} onClick={() => void loadCandidates()}>Refresh</Button>
+          </Space>
+        )}
       >
         <Row gutter={[12, 12]}>
           <Col xs={24} md={10}>
@@ -976,48 +1166,58 @@ function CandidatesTab({
       </Card>
 
       {error && <Alert type="error" showIcon message={error} />}
+      {atsMessage && <Alert type="info" showIcon message={atsMessage} closable onClose={() => setAtsMessage(null)} />}
 
-      <Row gutter={[16, 16]}>
-        <Col xs={24} xxl={14}>
-          <Card
-            className={GLASS_CARD_CLASS}
-            title={`Candidates (${total})`}
-            extra={<Text type="secondary">Click a row to open details</Text>}
-            loading={loading}
-          >
-            <Table<CandidateProfile>
-              rowKey={(candidate) => candidate.id}
-              columns={candidateColumns}
-              dataSource={items}
-              pagination={false}
-              locale={{ emptyText: 'No candidates found' }}
-              scroll={{ x: isMobile ? 560 : 680 }}
-              rowClassName={(candidate) => selected?.id === candidate.id ? 'bg-emerald-50/60' : ''}
-              onRow={(candidate) => ({
-                onClick: () => setSelected(candidate),
-              })}
-            />
-            <div className="mt-4">
-              <Pagination
-                current={page}
-                pageSize={pageSize}
-                total={total}
-                showSizeChanger
-                pageSizeOptions={['8', '12', '20', '50']}
-                onChange={(nextPage, nextPageSize) => {
-                  setPage(nextPage)
-                  setPageSize(nextPageSize)
-                }}
-                showTotal={(t, range) => `${range[0]}-${range[1]} of ${t}`}
-              />
-            </div>
-          </Card>
-        </Col>
+      <Card
+        className={GLASS_CARD_CLASS}
+        title={`Candidates (${total})`}
+        extra={<Text type="secondary">Open a candidate profile from Actions · Auto-refresh: 5s</Text>}
+        loading={loading}
+      >
+        <Table<CandidateProfile>
+          rowKey={(candidate) => candidate.id}
+          columns={candidateColumns}
+          dataSource={items}
+          pagination={false}
+          locale={{ emptyText: 'No candidates found' }}
+          scroll={{ x: isMobile ? 740 : 980 }}
+          rowClassName={(candidate) => selected?.id === candidate.id ? 'bg-emerald-50/60' : ''}
+          onRow={(candidate) => ({
+            onClick: () => {
+              void openProfile(candidate)
+            },
+          })}
+        />
+        <div className="mt-4">
+          <Pagination
+            current={page}
+            pageSize={pageSize}
+            total={total}
+            showSizeChanger
+            pageSizeOptions={['8', '12', '20', '50']}
+            onChange={(nextPage, nextPageSize) => {
+              setPage(nextPage)
+              setPageSize(nextPageSize)
+            }}
+            showTotal={(t, range) => `${range[0]}-${range[1]} of ${t}`}
+          />
+        </div>
+      </Card>
 
-        <Col xs={24} xxl={10}>
-          <CandidateInfoCard candidate={selected} />
-        </Col>
-      </Row>
+      <Modal
+        title="Candidate Profile"
+        open={profileOpen}
+        onCancel={() => setProfileOpen(false)}
+        footer={null}
+        width={isMobile ? '100%' : 980}
+        style={isMobile ? { top: 12, paddingBottom: 12 } : { top: 24 }}
+      >
+        <div className="max-h-[72vh] overflow-y-auto pr-1">
+          {profileLoading && !selected
+            ? <Card className={GLASS_CARD_CLASS} loading />
+            : <CandidateInfoCard candidate={selected} onAtsPush={(candidateId) => void handleAtsPush(candidateId)} />}
+        </div>
+      </Modal>
     </Space>
   )
 }
@@ -1099,11 +1299,213 @@ function CompareTab() {
   )
 }
 
+function MatchTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) => void }) {
+  const [jobDescription, setJobDescription] = useState('')
+  const [mustHaveSkills, setMustHaveSkills] = useState('')
+  const [minScore, setMinScore] = useState(0.75)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [result, setResult] = useState<JobMatchResponse | null>(null)
+
+  async function runMatch(page = 1, pageSize = 10) {
+    if (!jobDescription.trim()) {
+      setError('Please provide a job description')
+      return
+    }
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await matchCandidates({
+        jobDescription: jobDescription.trim(),
+        mustHaveSkills: mustHaveSkills
+          .split(',')
+          .map((skill) => skill.trim())
+          .filter(Boolean),
+        minScore,
+        page,
+        pageSize,
+      })
+      setResult(response)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Matching failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Space direction="vertical" size="middle" className="w-full">
+      <Card className={GLASS_CARD_CLASS} title="Job Match Scoring">
+        <Space direction="vertical" size="middle" className="w-full">
+          <Input.TextArea
+            rows={4}
+            value={jobDescription}
+            onChange={(event) => setJobDescription(event.target.value)}
+            placeholder="Paste a job description to rank candidates by fit."
+          />
+          <Input
+            value={mustHaveSkills}
+            onChange={(event) => setMustHaveSkills(event.target.value)}
+            placeholder="Optional must-have skills (comma-separated)"
+          />
+          <Space align="center" wrap>
+            <Text type="secondary">Minimum score</Text>
+            <InputNumber
+              min={0.75}
+              max={1}
+              step={0.01}
+              value={minScore}
+              onChange={(value) => setMinScore(typeof value === 'number' ? value : 0.75)}
+            />
+          </Space>
+          <Space wrap>
+            <Button type="primary" icon={<SearchOutlined />} loading={loading} onClick={() => void runMatch(1, result?.pageSize ?? 10)}>
+              Rank Candidates
+            </Button>
+          </Space>
+          {error && <Alert type="error" showIcon message={error} />}
+          {result && (
+            <Space direction="vertical" size="middle" className="w-full">
+              <Space wrap>
+                <Tag color="blue">Total matches: {result.total}</Tag>
+                <Tag color="cyan">Min score: {minScore.toFixed(2)}</Tag>
+                <Tag color="processing">Must-have inferred: {result.inferredMustHaveSkills.join(', ') || '-'}</Tag>
+              </Space>
+              <Table
+                rowKey={(item) => item.candidateId}
+                loading={loading}
+                dataSource={result.items}
+                pagination={{
+                  current: result.page,
+                  pageSize: result.pageSize,
+                  total: result.total,
+                  showSizeChanger: true,
+                  onChange: (page, pageSize) => {
+                    void runMatch(page, pageSize)
+                  },
+                }}
+                columns={[
+                  {
+                    title: 'Candidate',
+                    dataIndex: 'displayName',
+                    key: 'displayName',
+                    render: (displayName: string, row: JobMatchResponse['items'][number]) => (
+                      <Button type="link" icon={<UserOutlined />} onClick={() => onOpenCandidate(row.candidateId)}>
+                        {displayName}
+                      </Button>
+                    ),
+                  },
+                  {
+                    title: 'Overall',
+                    dataIndex: 'overallScore',
+                    key: 'overallScore',
+                    width: 120,
+                    render: (value: number) => <Tag color={scoreTagColor(value)}>{value.toFixed(3)}</Tag>,
+                  },
+                  {
+                    title: 'Must-have',
+                    dataIndex: 'mustHaveCoverage',
+                    key: 'mustHaveCoverage',
+                    width: 130,
+                    render: (value: number) => `${(value * 100).toFixed(0)}%`,
+                  },
+                  {
+                    title: 'Skill',
+                    dataIndex: 'skillCoverage',
+                    key: 'skillCoverage',
+                    width: 110,
+                    render: (value: number) => `${(value * 100).toFixed(0)}%`,
+                  },
+                  {
+                    title: 'Years',
+                    dataIndex: 'yearsFit',
+                    key: 'yearsFit',
+                    width: 100,
+                    render: (value: number) => `${(value * 100).toFixed(0)}%`,
+                  },
+                  {
+                    title: 'Missing Must-have',
+                    dataIndex: 'missingMustHave',
+                    key: 'missingMustHave',
+                    render: (values: string[]) => values.length > 0
+                      ? values.map((value) => <Tag color="orange" key={value}>{value}</Tag>)
+                      : <Text type="secondary">-</Text>,
+                  },
+                ]}
+                scroll={{ x: 920 }}
+              />
+            </Space>
+          )}
+        </Space>
+      </Card>
+    </Space>
+  )
+}
+
+function EvalTab() {
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [result, setResult] = useState<EvalRunResponse | null>(null)
+
+  async function handleRunEval() {
+    setLoading(true)
+    setError(null)
+    try {
+      const response = await runEval({ minScore: 0.75, useFeedbackTuning: true })
+      setResult(response)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to run evaluation')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Space direction="vertical" size="middle" className="w-full">
+      <Card className={GLASS_CARD_CLASS} title="RAG Evaluation">
+        <Space direction="vertical" size="middle" className="w-full">
+          <Paragraph type="secondary" className="mb-0">
+            Run built-in quality checks to track retrieval relevance and confidence over time.
+          </Paragraph>
+          <Button type="primary" icon={<SearchOutlined />} loading={loading} onClick={() => void handleRunEval()}>
+            Run Evaluation Suite
+          </Button>
+          {error && <Alert type="error" showIcon message={error} />}
+          {result && (
+            <Space direction="vertical" size="middle" className="w-full">
+              <Row gutter={[12, 12]}>
+                <Col xs={12} md={6}><Statistic title="Queries" value={result.totalQueries} /></Col>
+                <Col xs={12} md={6}><Statistic title="Avg Term Recall" value={(result.averageTermRecall * 100).toFixed(1)} suffix="%" /></Col>
+                <Col xs={12} md={6}><Statistic title="Avg Source Recall" value={(result.averageSourceRecall * 100).toFixed(1)} suffix="%" /></Col>
+                <Col xs={12} md={6}><Statistic title="Avg Confidence" value={result.averageConfidence.toFixed(3)} /></Col>
+              </Row>
+              <Table
+                rowKey={(item) => item.question}
+                dataSource={result.cases}
+                pagination={false}
+                columns={[
+                  { title: 'Query', dataIndex: 'question', key: 'question' },
+                  { title: 'Term Recall', dataIndex: 'termRecall', key: 'termRecall', width: 120, render: (value: number) => `${(value * 100).toFixed(0)}%` },
+                  { title: 'Source Recall', dataIndex: 'sourceRecall', key: 'sourceRecall', width: 130, render: (value: number) => `${(value * 100).toFixed(0)}%` },
+                  { title: 'Confidence', dataIndex: 'confidenceScore', key: 'confidenceScore', width: 120, render: (value: number) => <Tag color={scoreTagColor(value)}>{value.toFixed(3)}</Tag> },
+                ]}
+                scroll={{ x: 760 }}
+              />
+            </Space>
+          )}
+        </Space>
+      </Card>
+    </Space>
+  )
+}
+
 function IngestTab() {
   const [loading, setLoading] = useState(false)
+  const [jobsLoading, setJobsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [events, setEvents] = useState<IngestProgressEvent[]>([])
   const [lastResult, setLastResult] = useState<number | null>(null)
+  const [ingestJobs, setIngestJobs] = useState<IngestJobStatus[]>([])
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [selectedFolderName, setSelectedFolderName] = useState<string>('')
   const folderInputRef = useRef<HTMLInputElement | null>(null)
@@ -1132,6 +1534,31 @@ function IngestTab() {
     if (!fileListRef.current) return
     fileListRef.current.scrollTop = fileListRef.current.scrollHeight
   }, [fileEvents.length])
+
+  async function loadJobs() {
+    setJobsLoading(true)
+    try {
+      const jobs = await listIngestJobs(20)
+      setIngestJobs(jobs)
+    } catch {
+      // best effort only
+    } finally {
+      setJobsLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    void loadJobs()
+  }, [])
+
+  useEffect(() => {
+    const hasRunningJob = ingestJobs.some((job) => job.status === 'queued' || job.status === 'running')
+    if (!hasRunningJob) return
+    const interval = window.setInterval(() => {
+      void loadJobs()
+    }, 3000)
+    return () => window.clearInterval(interval)
+  }, [ingestJobs])
 
   function handleChooseFolder() {
     folderInputRef.current?.click()
@@ -1232,6 +1659,16 @@ function IngestTab() {
     setLoading(false)
   }
 
+  async function handleStartBackgroundJob() {
+    setError(null)
+    try {
+      await startIngestJob()
+      await loadJobs()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to start background ingest job')
+    }
+  }
+
   return (
     <Space direction="vertical" size="middle" className="w-full">
       <Card className={GLASS_CARD_CLASS} title="Ingest Resumes">
@@ -1262,6 +1699,9 @@ function IngestTab() {
             </Button>
             <Button size="large" loading={loading} onClick={handleIngest}>
               Run Configured Server Folder
+            </Button>
+            <Button size="large" icon={<RocketOutlined />} onClick={() => void handleStartBackgroundJob()}>
+              Run As Background Job
             </Button>
           </Space>
 
@@ -1299,6 +1739,29 @@ function IngestTab() {
               </ul>
             </Card>
           )}
+
+          <Card
+            className="rounded-xl border border-slate-200"
+            title="Background Ingestion Jobs"
+            extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => void loadJobs()}>Refresh</Button>}
+          >
+            <Table<IngestJobStatus>
+              rowKey={(job) => job.id}
+              size="small"
+              loading={jobsLoading}
+              dataSource={ingestJobs}
+              pagination={false}
+              locale={{ emptyText: 'No jobs yet' }}
+              columns={[
+                { title: 'Started', dataIndex: 'startedAt', key: 'startedAt', render: (value: string) => formatDate(value) },
+                { title: 'Status', dataIndex: 'status', key: 'status', render: (status: string) => <Tag color={status === 'completed' ? 'success' : status === 'failed' ? 'error' : 'processing'}>{status}</Tag> },
+                { title: 'Processed', dataIndex: 'processed', key: 'processed', width: 110 },
+                { title: 'Skipped', dataIndex: 'skipped', key: 'skipped', width: 100 },
+                { title: 'Message', dataIndex: 'message', key: 'message', render: (message: string) => message ? <Text>{message}</Text> : <Text type="secondary">-</Text> },
+              ]}
+              scroll={{ x: 760 }}
+            />
+          </Card>
         </Space>
       </Card>
     </Space>
@@ -1308,6 +1771,7 @@ function IngestTab() {
 function AuditTab() {
   type AuditFileRow = IngestAuditRun['files'][number]
   const [runs, setRuns] = useState<IngestAuditRun[]>([])
+  const [metrics, setMetrics] = useState<MetricsSummary | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -1315,8 +1779,12 @@ function AuditTab() {
     setLoading(true)
     setError(null)
     try {
-      const data = await fetchIngestAudit(30)
+      const [data, summary] = await Promise.all([
+        fetchIngestAudit(30),
+        fetchMetricsSummary().catch(() => null),
+      ])
       setRuns(data)
+      setMetrics(summary)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load audit history')
     } finally {
@@ -1395,6 +1863,14 @@ function AuditTab() {
   return (
     <Space direction="vertical" size="middle" className="w-full">
       <Card className={GLASS_CARD_CLASS} title="Ingestion Audit" extra={<Button icon={<ReloadOutlined />} onClick={() => void loadAudit()}>Refresh</Button>}>
+        {metrics && (
+          <Row gutter={[12, 12]} className="mb-4">
+            <Col xs={12} md={6}><Statistic title="Queries" value={metrics.queryCount} /></Col>
+            <Col xs={12} md={6}><Statistic title="Query Errors" value={metrics.queryErrors} /></Col>
+            <Col xs={12} md={6}><Statistic title="Avg Query Latency (ms)" value={metrics.avgQueryLatencyMs.toFixed(1)} /></Col>
+            <Col xs={12} md={6}><Statistic title="Ingest Runs" value={metrics.ingestRunCount} /></Col>
+          </Row>
+        )}
         {error && <Alert type="error" showIcon message={error} className="mb-3" />}
         {runs.length === 0 ? (
           <Empty description={loading ? 'Loading...' : 'No ingestion runs yet'} />
@@ -1432,12 +1908,55 @@ function AuditTab() {
 export default function App() {
   const screens = useBreakpoint()
   const isMobile = !screens.lg
-  const [activeTab, setActiveTab] = useState('query')
-  const [selectedCandidateId, setSelectedCandidateId] = useState<string | undefined>(undefined)
+  const initialRoute = parseTabRouteFromHash(typeof window !== 'undefined' ? window.location.hash : '')
+  const [activeTab, setActiveTab] = useState<TabKey>(initialRoute.tab)
+  const [selectedCandidateId, setSelectedCandidateId] = useState<string | undefined>(initialRoute.candidateId)
+
+  function syncHash(tab: TabKey, candidateId?: string, mode: 'push' | 'replace' = 'push') {
+    if (typeof window === 'undefined') return
+    const nextHash = buildHashForTab(tab, candidateId)
+    if (window.location.hash === nextHash) return
+    const base = window.location.href.split('#')[0]
+    if (mode === 'replace') {
+      window.history.replaceState(null, '', `${base}${nextHash}`)
+    } else {
+      window.location.hash = nextHash
+    }
+  }
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (!window.location.hash || !window.location.hash.startsWith('#/')) {
+      syncHash(activeTab, selectedCandidateId, 'replace')
+    }
+
+    function onHashChange() {
+      const next = parseTabRouteFromHash(window.location.hash)
+      setActiveTab(next.tab)
+      setSelectedCandidateId(next.candidateId)
+    }
+
+    window.addEventListener('hashchange', onHashChange)
+    return () => {
+      window.removeEventListener('hashchange', onHashChange)
+    }
+  }, [])
+
+  function handleTabChange(key: string) {
+    const nextTab = TAB_KEYS.find((tab) => tab === key) ?? 'query'
+    setActiveTab(nextTab)
+    if (nextTab !== 'candidates') {
+      setSelectedCandidateId(undefined)
+      syncHash(nextTab)
+      return
+    }
+    syncHash('candidates', selectedCandidateId)
+  }
 
   function openCandidate(candidateId: string) {
     setSelectedCandidateId(candidateId)
     setActiveTab('candidates')
+    syncHash('candidates', candidateId)
   }
 
   return (
@@ -1465,7 +1984,7 @@ export default function App() {
           <div className="mx-auto w-full max-w-[1360px]">
           <Tabs
             activeKey={activeTab}
-            onChange={setActiveTab}
+            onChange={handleTabChange}
             tabPosition="top"
             size={isMobile ? 'middle' : 'large'}
             className="[&_.ant-tabs-nav]:mb-4 [&_.ant-tabs-tab]:px-3 [&_.ant-tabs-nav::before]:border-slate-200 [&_.ant-tabs-content-holder]:p-0"
@@ -1481,11 +2000,17 @@ export default function App() {
                 children: <QueryTab onOpenCandidate={openCandidate} />,
               },
               {
+                key: 'match',
+                label: 'Match',
+                children: <MatchTab onOpenCandidate={openCandidate} />,
+              },
+              {
                 key: 'candidates',
                 label: 'Candidates',
                 children: (
                   <CandidatesTab
                     selectedCandidateId={selectedCandidateId}
+                    isActive={activeTab === 'candidates'}
                   />
                 ),
               },
@@ -1498,6 +2023,11 @@ export default function App() {
                 key: 'audit',
                 label: 'Audit',
                 children: <AuditTab />,
+              },
+              {
+                key: 'eval',
+                label: 'Eval',
+                children: <EvalTab />,
               },
             ]}
             style={{ minHeight: 0 }}

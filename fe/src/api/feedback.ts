@@ -5,6 +5,9 @@ export interface FeedbackStats {
   helpful: number
   notHelpful: number
   helpfulRate: number
+  recommendedMinScore: number
+  helpfulAvgSourceScore?: number | null
+  notHelpfulAvgSourceScore?: number | null
 }
 
 export interface QueryFeedbackEntry {
@@ -12,6 +15,8 @@ export interface QueryFeedbackEntry {
   answer: string
   helpful: boolean
   notes: string
+  minScoreUsed?: number | null
+  avgSourceScore?: number | null
   createdAt: string
 }
 
@@ -32,6 +37,8 @@ export async function submitQueryFeedback(payload: {
   answer: string
   helpful: boolean
   notes?: string
+  minScoreUsed?: number
+  avgSourceScore?: number
 }): Promise<QueryFeedbackEntry> {
   const base = getBaseUrl()
   const res = await fetch(`${base}/api/query/feedback`, {
@@ -52,4 +59,14 @@ export async function fetchFeedbackStats(): Promise<FeedbackStats> {
     throw await parseError(res)
   }
   return res.json()
+}
+
+export async function fetchRecommendedMinScore(baseline = 0.75): Promise<number> {
+  const base = getBaseUrl()
+  const res = await fetch(`${base}/api/query/feedback/recommendation?baseline=${encodeURIComponent(String(baseline))}`)
+  if (!res.ok) {
+    throw await parseError(res)
+  }
+  const data = await res.json() as { recommendedMinScore?: number }
+  return data.recommendedMinScore ?? baseline
 }

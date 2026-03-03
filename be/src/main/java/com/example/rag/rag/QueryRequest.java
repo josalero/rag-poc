@@ -9,5 +9,6 @@ public record QueryRequest(
         @Positive Integer maxResults,
         @DecimalMin("0.0") Double minScore,
         @Positive Integer page,
-        @Positive Integer pageSize
+        @Positive Integer pageSize,
+        Boolean useFeedbackTuning
 ) {}
