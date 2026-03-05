@@ -49,5 +49,18 @@ export async function matchCandidates(payload: {
   if (!res.ok) {
     throw await parseError(res)
   }
-  return res.json()
+  const data = await res.json() as Partial<JobMatchResponse>
+  const items = Array.isArray(data.items) ? data.items : []
+  return {
+    items: items.map((item) => ({
+      ...item,
+      matchedSkills: Array.isArray(item.matchedSkills) ? item.matchedSkills : [],
+      missingMustHave: Array.isArray(item.missingMustHave) ? item.missingMustHave : [],
+      suggestedRoles: Array.isArray(item.suggestedRoles) ? item.suggestedRoles : [],
+    })),
+    page: typeof data.page === 'number' ? data.page : 1,
+    pageSize: typeof data.pageSize === 'number' ? data.pageSize : 10,
+    total: typeof data.total === 'number' ? data.total : items.length,
+    inferredMustHaveSkills: Array.isArray(data.inferredMustHaveSkills) ? data.inferredMustHaveSkills : [],
+  }
 }

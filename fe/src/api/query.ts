@@ -33,6 +33,7 @@ export interface QueryOptions {
   page?: number
   pageSize?: number
   useFeedbackTuning?: boolean
+  scopeId?: string
 }
 
 export async function querySkills(question: string, options?: QueryOptions): Promise<QueryResponse> {
@@ -44,6 +45,7 @@ export async function querySkills(question: string, options?: QueryOptions): Pro
     page?: number
     pageSize?: number
     useFeedbackTuning?: boolean
+    scopeId?: string
   } = { question }
   if (options?.maxResults !== undefined) {
     body.maxResults = options.maxResults
@@ -59,6 +61,9 @@ export async function querySkills(question: string, options?: QueryOptions): Pro
   }
   if (options?.useFeedbackTuning !== undefined) {
     body.useFeedbackTuning = options.useFeedbackTuning
+  }
+  if (options?.scopeId) {
+    body.scopeId = options.scopeId
   }
   const res = await fetch(`${base}/api/query`, {
     method: 'POST',

@@ -44,6 +44,26 @@ flowchart TB
     MC --> MS["ObservabilityService"]
 ```
 
+## Feature package layout
+
+The backend is organized by feature, with `controller`, `service`, `model`, and `domain` siblings under each bounded area:
+
+```text
+com.example.rag.feature.<feature-name>/
+  controller/
+  service/
+  model/
+  domain/
+```
+
+Examples:
+
+- `feature/query/{controller,service,model}`
+- `feature/candidate/{controller,service,model,domain}`
+- `feature/ingest/{controller,service,model}`
+- `feature/match/{controller,service,model,domain}`
+- `feature/role/domain` (canonical skill catalog and role definitions)
+
 ## Additional API modules
 
 - Matching:
@@ -59,7 +79,7 @@ flowchart TB
 
 - Retrieval plane:
   - Segment embeddings are stored in `EmbeddingStore<TextSegment>`.
-  - Query path performs vector retrieval, hybrid rescoring, deduplication, and answer generation.
+  - Query path performs vector retrieval, hybrid rescoring, candidate-aware deduplication, and answer generation.
 - Candidate profile plane:
   - Candidate profile state is maintained in `CandidateProfileService` in memory.
   - Per-ingest snapshots are persisted as `CandidateProfileVersion` records inside the profile object.

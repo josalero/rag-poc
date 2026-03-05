@@ -41,13 +41,16 @@ Default threshold baseline:
 ## Result shaping
 
 - Deduplication key policy:
-  - primary: source filename.
+  - primary: `candidate_id` metadata (candidate-level dedupe).
+  - secondary: source filename.
   - fallback: normalized segment text.
 - Context limit for answer synthesis:
   - top `MAX_CONTEXT_SEGMENTS` matches.
 - Pagination:
   - applied after ranking and deduplication.
   - response includes `page`, `pageSize`, `totalSources`.
+
+For legacy segments without `candidate_id`, the query service attempts source-to-candidate resolution via `CandidateProfileService` before deduplication.
 
 ## Explainability payload
 

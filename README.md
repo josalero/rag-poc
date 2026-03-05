@@ -142,7 +142,7 @@ You should get something like `{"documentsProcessed": 5}`. If the folder is empt
 
 **Option A – Web UI**
 
-Open **http://localhost:8084** in a browser. The app now has tabs for **Query**, **Candidates**, **Compare**, **Ingest**, and **Audit**.
+Open **http://localhost:8084** in a browser. The app uses hash routes and includes pages for **Ingest** (default), **Query**, **Match**, **Candidates**, **Compare**, **Audit**, and **Eval**.
 
 **Option B – API (curl)**
 
@@ -161,6 +161,7 @@ The `answer` text is sectioned (`ANSWER`, `KEY_FINDINGS`, `LIMITATIONS`, `NEXT_S
 
 Notes:
 - `maxResults`, `minScore`, `page`, and `pageSize` are optional per-query overrides.
+- Query results are deduplicated at **candidate level** first (using `candidate_id` metadata), then by source/text fallback for legacy segments.
 - Returned sources are still similarity-ranked retrieval results (`top-k`), so "all qualifying" depends on the requested `maxResults` and the configured `RAG_MAX_ALLOWED_RESULTS`.
 
 **Option C – Swagger**

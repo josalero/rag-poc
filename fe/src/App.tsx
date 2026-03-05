@@ -88,19 +88,20 @@ type SavedQuery = {
   question: string
   maxResults: number
   minScore: number
+  scopeId?: string
   createdAt: string
 }
 
 function parseTabRouteFromHash(hashValue: string): { tab: TabKey; candidateId?: string } {
   const hash = (hashValue || '').trim()
   if (!hash.startsWith('#/')) {
-    return { tab: 'query' }
+    return { tab: 'ingest' }
   }
   const raw = hash.slice(2)
   const [routePart, queryPart = ''] = raw.split('?')
   const route = routePart.trim().toLowerCase()
   const isKnownTab = TAB_KEYS.some((key) => key === route)
-  const tab: TabKey = isKnownTab ? route as TabKey : 'query'
+  const tab: TabKey = isKnownTab ? route as TabKey : 'ingest'
   if (tab !== 'candidates' || !queryPart) {
     return { tab }
   }
@@ -445,17 +446,21 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
   const isMobile = !screens.md
   const [question, setQuestion] = useState('')
   const [activeQuestion, setActiveQuestion] = useState('')
+  const [scopeId, setScopeId] = useState('')
+  const [activeScopeId, setActiveScopeId] = useState('')
   const [maxResults, setMaxResults] = useState(60)
   const [minScore, setMinScore] = useState(0.75)
   const [useFeedbackTuning, setUseFeedbackTuning] = useState(true)
   const [result, setResult] = useState<QueryResponse | null>(null)
   const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([])
   const [candidateNameById, setCandidateNameById] = useState<Record<string, string>>({})
+  const [candidateRolesById, setCandidateRolesById] = useState<Record<string, string[]>>({})
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [feedbackStats, setFeedbackStats] = useState<FeedbackStats | null>(null)
   const [feedbackNotes, setFeedbackNotes] = useState('')
   const [submittingFeedback, setSubmittingFeedback] = useState(false)
+  const sourcesLoading = loading && result !== null
 
   useEffect(() => {
     try {
@@ -481,7 +486,9 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
       new Set((result?.sources ?? []).map((source) => source.candidateId).filter(Boolean))
     )
     if (candidateIds.length === 0) return
-    const missingIds = candidateIds.filter((candidateId) => !candidateNameById[candidateId])
+    const missingIds = candidateIds.filter(
+      (candidateId) => !candidateNameById[candidateId] || candidateRolesById[candidateId] === undefined
+    )
     if (missingIds.length === 0) return
 
     let cancelled = false
@@ -489,17 +496,32 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
       missingIds.map(async (candidateId) => {
         try {
           const candidate = await fetchCandidate(candidateId)
-          return [candidateId, candidate.displayName || candidateId] as const
+          return {
+            candidateId,
+            displayName: candidate.displayName || candidateId,
+            roles: Array.isArray(candidate.suggestedRoles) ? candidate.suggestedRoles : [],
+          } as const
         } catch {
-          return [candidateId, candidateId] as const
+          return {
+            candidateId,
+            displayName: candidateId,
+            roles: [],
+          } as const
         }
       })
     ).then((entries) => {
       if (cancelled) return
       setCandidateNameById((prev) => {
         const next = { ...prev }
-        for (const [candidateId, displayName] of entries) {
-          next[candidateId] = displayName
+        for (const entry of entries) {
+          next[entry.candidateId] = entry.displayName
+        }
+        return next
+      })
+      setCandidateRolesById((prev) => {
+        const next = { ...prev }
+        for (const entry of entries) {
+          next[entry.candidateId] = entry.roles
         }
         return next
       })
@@ -508,7 +530,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
     return () => {
       cancelled = true
     }
-  }, [result?.sources, candidateNameById])
+  }, [result?.sources, candidateNameById, candidateRolesById])
 
   const structuredAnswer = useMemo(() => parseStructuredAnswer(result?.answer ?? ''), [result?.answer])
   const groupedSources = useMemo(() => groupBySource(result?.sources ?? []), [result?.sources])
@@ -535,6 +557,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
     saveQuery: boolean
     overrideMaxResults?: number
     overrideMinScore?: number
+    overrideScopeId?: string
   }) {
     if (!params.q.trim()) return
     setLoading(true)
@@ -542,15 +565,18 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
     try {
       const effectiveMaxResults = params.overrideMaxResults ?? maxResults
       const effectiveMinScore = params.overrideMinScore ?? minScore
+      const effectiveScopeId = (params.overrideScopeId ?? scopeId).trim()
       const data = await querySkills(params.q.trim(), {
         maxResults: effectiveMaxResults,
         minScore: effectiveMinScore,
         page: params.page,
         pageSize: params.pageSize,
         useFeedbackTuning,
+        scopeId: effectiveScopeId || undefined,
       })
       setResult(data)
       setActiveQuestion(params.q.trim())
+      setActiveScopeId(effectiveScopeId)
       setFeedbackNotes('')
       if (params.saveQuery) {
         const next: SavedQuery[] = [
@@ -559,9 +585,14 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
             question: params.q.trim(),
             maxResults: effectiveMaxResults,
             minScore: effectiveMinScore,
+            scopeId: effectiveScopeId || undefined,
             createdAt: new Date().toISOString(),
           },
-          ...savedQueries.filter((item) => item.question.trim().toLowerCase() !== params.q.trim().toLowerCase()),
+          ...savedQueries.filter((item) => {
+            const sameQuestion = item.question.trim().toLowerCase() === params.q.trim().toLowerCase()
+            const sameScope = (item.scopeId ?? '').trim().toLowerCase() === effectiveScopeId.toLowerCase()
+            return !(sameQuestion && sameScope)
+          }),
         ]
         persistSavedQueries(next)
       }
@@ -637,6 +668,18 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
         ),
       },
       {
+        title: 'Roles',
+        dataIndex: 'candidateId',
+        key: 'roles',
+        width: isMobile ? 220 : 280,
+        render: (candidateId: string) => {
+          const roles = candidateRolesById[candidateId] ?? []
+          return roles.length > 0
+            ? roles.slice(0, 3).map((role) => <Tag color="geekblue" key={`${candidateId}-${role}`}>{role}</Tag>)
+            : <Text type="secondary">-</Text>
+        },
+      },
+      {
         title: 'Actions',
         key: 'actions',
         width: isMobile ? 180 : 220,
@@ -656,7 +699,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
         ),
       },
     ],
-    [candidateNameById, isMobile, onOpenCandidate]
+    [candidateNameById, candidateRolesById, isMobile, onOpenCandidate]
   )
 
   const groupedColumns = useMemo<TableProps<GroupedSource>['columns']>(
@@ -695,6 +738,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
             current={result?.page}
             pageSize={result?.pageSize}
             total={result?.totalSources}
+            disabled={sourcesLoading}
             showSizeChanger
             pageSizeOptions={['5', '10', '20', '50']}
             showTotal={(total, range) => `${range[0]}-${range[1]} of ${total}`}
@@ -704,6 +748,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 page,
                 pageSize,
                 saveQuery: false,
+                overrideScopeId: activeScopeId,
               })
             }}
           />
@@ -712,8 +757,9 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
             size="small"
             columns={sourceColumns}
             dataSource={result?.sources ?? []}
+            loading={sourcesLoading}
             pagination={false}
-            scroll={{ x: 760 }}
+            scroll={{ x: 1040 }}
             expandable={{
               expandedRowRender: (source) => (
                 <div className="space-y-3 py-1">
@@ -751,6 +797,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
           size="small"
           columns={groupedColumns}
           dataSource={groupedSources}
+          loading={sourcesLoading}
           pagination={{ pageSize: 10, showSizeChanger: false }}
           scroll={{ x: 680 }}
           expandable={{
@@ -784,7 +831,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
             Search all qualifying resume segments with ranked evidence and open candidate profiles directly.
           </Paragraph>
           <Row gutter={[12, 12]}>
-            <Col xs={24} lg={16}>
+            <Col xs={24} lg={12}>
               <Space.Compact className="w-full">
                 <Input
                   size="large"
@@ -837,6 +884,16 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 Use feedback recommendation
               </Button>
             </Col>
+            <Col xs={24} lg={4}>
+              <Text type="secondary">Scope (optional)</Text>
+              <Input
+                value={scopeId}
+                onChange={(e) => setScopeId(e.target.value)}
+                className="mt-2 w-full"
+                placeholder="e.g. tenant-a"
+                allowClear
+              />
+            </Col>
           </Row>
           <Space wrap>
             <Button type={useFeedbackTuning ? 'primary' : 'default'} onClick={() => setUseFeedbackTuning((prev) => !prev)}>
@@ -857,6 +914,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                       setQuestion(item.question)
                       setMaxResults(item.maxResults)
                       setMinScore(item.minScore)
+                      setScopeId(item.scopeId ?? '')
                       void runQuery({
                         q: item.question,
                         page: 1,
@@ -864,6 +922,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                         saveQuery: false,
                         overrideMaxResults: item.maxResults,
                         overrideMinScore: item.minScore,
+                        overrideScopeId: item.scopeId,
                       })
                     }}
                   >
@@ -963,6 +1022,11 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                   Page scores: avg {scoreStats.avg.toFixed(3)}, min {scoreStats.min.toFixed(3)}, max {scoreStats.max.toFixed(3)}.
                 </Paragraph>
               )}
+              {activeScopeId && (
+                <Tag color="cyan" className="mt-3">
+                  Scope: {activeScopeId}
+                </Tag>
+              )}
               {result.explainability && (
                 <Space direction="vertical" size={8} className="mt-3 w-full">
                   <Tag color={scoreTagColor(result.explainability.confidenceScore)}>
@@ -993,7 +1057,11 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
             <Card
               className={GLASS_CARD_CLASS}
               title={`Sources (${result.totalSources})`}
-              extra={<Text type="secondary">Showing {result.sources.length} on this page</Text>}
+              extra={(
+                <Text type="secondary">
+                  {sourcesLoading ? 'Loading page...' : `Showing ${result.sources.length} on this page`}
+                </Text>
+              )}
             >
               {result.totalSources === 0 ? (
                 <Alert type="info" showIcon message="No sources matched this query." />
@@ -1384,11 +1452,15 @@ function MatchTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
           <Space align="center" wrap>
             <Text type="secondary">Minimum score</Text>
             <InputNumber
-              min={0.75}
+              min={0}
               max={1}
               step={0.01}
               value={minScore}
-              onChange={(value) => setMinScore(typeof value === 'number' ? value : 0.75)}
+              onChange={(value) => {
+                if (typeof value === 'number' && !Number.isNaN(value)) {
+                  setMinScore(value)
+                }
+              }}
             />
           </Space>
           <Space wrap>
@@ -1402,8 +1474,13 @@ function MatchTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
               <Space wrap>
                 <Tag color="blue">Total matches: {result.total}</Tag>
                 <Tag color="cyan">Min score: {minScore.toFixed(2)}</Tag>
-                <Tag color="processing">Must-have inferred: {result.inferredMustHaveSkills.join(', ') || '-'}</Tag>
+                <Tag color="processing">
+                  Must-have applied: {(result.inferredMustHaveSkills ?? []).join(', ') || 'Auto-detect unavailable'}
+                </Tag>
               </Space>
+              {result.total === 0 && (
+                <Alert type="info" showIcon message="No candidates matched this job description at the selected threshold." />
+              )}
               <Table
                 rowKey={(item) => item.candidateId}
                 loading={loading}
@@ -1440,14 +1517,27 @@ function MatchTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                     dataIndex: 'mustHaveCoverage',
                     key: 'mustHaveCoverage',
                     width: 130,
-                    render: (value: number) => `${(value * 100).toFixed(0)}%`,
+                    render: (_: number, row: JobMatchResponse['items'][number]) => {
+                      const matched = Array.isArray(row.matchedSkills) ? row.matchedSkills.length : 0
+                      const missing = Array.isArray(row.missingMustHave) ? row.missingMustHave.length : 0
+                      const total = matched + missing
+                      if (total === 0) {
+                        return <Text type="secondary">-</Text>
+                      }
+                      const pct = (matched / total) * 100
+                      return `${pct.toFixed(0)}% (${matched}/${total})`
+                    },
                   },
                   {
                     title: 'Skill',
                     dataIndex: 'skillCoverage',
                     key: 'skillCoverage',
                     width: 110,
-                    render: (value: number) => `${(value * 100).toFixed(0)}%`,
+                    render: (value: number) => (
+                      Number.isFinite(value)
+                        ? `${(Math.max(0, Math.min(1, value)) * 100).toFixed(0)}%`
+                        : '-'
+                    ),
                   },
                   {
                     title: 'Roles',
@@ -1465,9 +1555,12 @@ function MatchTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                     title: 'Missing Must-have',
                     dataIndex: 'missingMustHave',
                     key: 'missingMustHave',
-                    render: (values: string[]) => values.length > 0
-                      ? values.map((value) => <Tag color="orange" key={value}>{value}</Tag>)
-                      : <Text type="secondary">-</Text>,
+                    render: (values?: string[]) => {
+                      const normalized = Array.isArray(values) ? values : []
+                      return normalized.length > 0
+                        ? normalized.map((value) => <Tag color="orange" key={value}>{value}</Tag>)
+                        : <Text type="secondary">-</Text>
+                    },
                   },
                 ]}
                 scroll={{ x: 920 }}
@@ -1994,7 +2087,7 @@ export default function App() {
   }, [])
 
   function handleTabChange(key: string) {
-    const nextTab = TAB_KEYS.find((tab) => tab === key) ?? 'query'
+    const nextTab = TAB_KEYS.find((tab) => tab === key) ?? 'ingest'
     setActiveTab(nextTab)
     if (nextTab !== 'candidates') {
       setSelectedCandidateId(undefined)
