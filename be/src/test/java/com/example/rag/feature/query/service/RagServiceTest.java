@@ -30,6 +30,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
@@ -161,6 +162,36 @@ class RagServiceTest {
         assertThat(response.sources().get(0).score()).isGreaterThan(0.8);
         assertThat(response.sources().get(0).vectorScore()).isEqualTo(0.95);
         assertThat(response.sources().get(1).source()).isEqualTo("bob.pdf");
+    }
+
+    @Test
+    void query_withSameParametersAcrossPages_reusesCachedComputation() {
+        Embedding queryEmbedding = new Embedding(new float[]{0.44f});
+        TextSegment alice = TextSegment.from("Alice has Java and Spring experience.");
+        alice.metadata().put("source", "alice.pdf");
+        TextSegment bob = TextSegment.from("Bob has AWS and Terraform experience.");
+        bob.metadata().put("source", "bob.pdf");
+        EmbeddingMatch<TextSegment> aliceMatch = new EmbeddingMatch<>(0.9, "id-cache-a", queryEmbedding, alice);
+        EmbeddingMatch<TextSegment> bobMatch = new EmbeddingMatch<>(0.86, "id-cache-b", queryEmbedding, bob);
+        EmbeddingSearchResult<TextSegment> searchResult = new EmbeddingSearchResult<>(List.of(aliceMatch, bobMatch));
+
+        when(embeddingModel.embed(any(String.class))).thenReturn(Response.from(queryEmbedding));
+        when(embeddingStore.search(any())).thenReturn(searchResult);
+        when(chatModel.chat(anyString())).thenReturn("Alice and Bob match.");
+
+        QueryResponse page1 = ragService.query("Who has Java and AWS?", 50, 0.0, 1, 1, false);
+        QueryResponse page2 = ragService.query("Who has Java and AWS?", 50, 0.0, 2, 1, false);
+
+        assertThat(page1.totalSources()).isEqualTo(2);
+        assertThat(page2.totalSources()).isEqualTo(2);
+        assertThat(page1.sources()).hasSize(1);
+        assertThat(page2.sources()).hasSize(1);
+        assertThat(page1.sources().get(0).source()).isEqualTo("alice.pdf");
+        assertThat(page2.sources().get(0).source()).isEqualTo("bob.pdf");
+
+        verify(embeddingModel, times(1)).embed(any(String.class));
+        verify(embeddingStore, times(1)).search(any());
+        verify(chatModel, times(1)).chat(anyString());
     }
 
     @Test

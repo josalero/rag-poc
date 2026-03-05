@@ -25,13 +25,18 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
@@ -44,6 +49,8 @@ public class RagService {
     private static final int DEFAULT_MAX_ALLOWED_RESULTS = 200;
     private static final int DEFAULT_PAGE_SIZE = 10;
     private static final int DEFAULT_MAX_PAGE_SIZE = 100;
+    private static final int DEFAULT_QUERY_CACHE_MAX_ENTRIES = 256;
+    private static final long DEFAULT_QUERY_CACHE_TTL_MILLIS = 15_000L;
     private static final int MAX_CONTEXT_SEGMENTS = 20;
     private static final int MAX_EXPLAINABILITY_TERMS = 8;
     private static final double DEFAULT_MIN_SCORE = 0.75d;
@@ -134,6 +141,8 @@ public class RagService {
     private final String retrieverStaticFilterKey;
     private final String retrieverStaticFilterValue;
     private final String retrieverDynamicFilterKey;
+    private final QueryResultCache queryResultCache;
+    private final Map<QueryCacheKey, CompletableFuture<QueryComputation>> queryComputationInFlight = new ConcurrentHashMap<>();
 
     RagService(EmbeddingStore<TextSegment> embeddingStore,
                EmbeddingModel embeddingModel,
@@ -256,6 +265,7 @@ public class RagService {
         this.retrieverStaticFilterKey = cleanNullable(retrieverStaticFilterKey);
         this.retrieverStaticFilterValue = cleanNullable(retrieverStaticFilterValue);
         this.retrieverDynamicFilterKey = cleanNullable(retrieverDynamicFilterKey);
+        this.queryResultCache = new QueryResultCache(DEFAULT_QUERY_CACHE_MAX_ENTRIES, DEFAULT_QUERY_CACHE_TTL_MILLIS);
     }
 
     public QueryResponse query(String question) {
@@ -331,37 +341,19 @@ public class RagService {
                 return response;
             }
 
-            List<String> queryTerms = extractQueryTerms(normalizedQuestion);
-            List<RankedMatch> rankedMatches = retrieveContents(normalizedQuestion, effectiveMaxResults, scopeId).stream()
-                    .map(content -> toRankedMatch(content, queryTerms))
-                    .sorted((a, b) -> Double.compare(b.hybridScore(), a.hybridScore()))
-                    .filter(match -> match.hybridScore() >= effectiveThreshold)
-                    .toList();
-            List<RankedMatch> uniqueMatches = deduplicateMatches(
-                    rankedMatches.stream()
-                            .map(this::resolveCandidateIdentity)
-                            .toList()
+            String cleanedScopeId = cleanNullable(scopeId);
+            QueryCacheKey cacheKey = new QueryCacheKey(
+                    normalize(normalizedQuestion),
+                    effectiveMaxResults,
+                    toScoreKey(effectiveThreshold),
+                    cleanedScopeId != null ? cleanedScopeId : ""
+            );
+            QueryComputation computation = getOrComputeQueryComputation(
+                    cacheKey,
+                    () -> computeQueryComputation(normalizedQuestion, effectiveMaxResults, effectiveThreshold, cleanedScopeId)
             );
 
-            if (uniqueMatches.isEmpty()) {
-                QueryResponse response = QueryResponse.of(
-                        noResultsAnswer,
-                        List.of(),
-                        effectivePage,
-                        effectivePageSize,
-                        0,
-                        new QueryExplainability(List.of(), queryTerms, 0.0d));
-                recordQuerySuccess(startedAt, 0);
-                return response;
-            }
-
-            List<RankedMatch> contextMatches = uniqueMatches.stream()
-                    .limit(MAX_CONTEXT_SEGMENTS)
-                    .toList();
-            String context = contextMatches.stream()
-                    .map(RankedMatch::text)
-                    .collect(java.util.stream.Collectors.joining("\n\n"));
-
+            List<RankedMatch> uniqueMatches = computation.uniqueMatches();
             int totalSources = uniqueMatches.size();
             int startIndex = Math.min((effectivePage - 1) * effectivePageSize, totalSources);
             int endIndex = Math.min(startIndex + effectivePageSize, totalSources);
@@ -385,10 +377,14 @@ public class RagService {
                 ));
             }
 
-            QueryExplainability explainability = buildExplainability(queryTerms, uniqueMatches);
-            String prompt = String.format(PROMPT_TEMPLATE, context, normalizedQuestion);
-            String answer = generateAnswerWithFallback(prompt, normalizedQuestion, queryTerms, contextMatches);
-            QueryResponse response = QueryResponse.of(answer, sources, effectivePage, effectivePageSize, totalSources, explainability);
+            QueryResponse response = QueryResponse.of(
+                    computation.answer(),
+                    sources,
+                    effectivePage,
+                    effectivePageSize,
+                    totalSources,
+                    computation.explainability()
+            );
             recordQuerySuccess(startedAt, totalSources);
             return response;
         } catch (RuntimeException ex) {
@@ -405,6 +401,82 @@ public class RagService {
         }
         long latencyMs = Math.max(0L, (System.nanoTime() - startedAt) / 1_000_000L);
         observabilityService.recordQuery(latencyMs, totalSources);
+    }
+
+    private QueryComputation computeQueryComputation(
+            String normalizedQuestion,
+            int effectiveMaxResults,
+            double effectiveThreshold,
+            String scopeId) {
+        List<String> queryTerms = extractQueryTerms(normalizedQuestion);
+        List<RankedMatch> rankedMatches = retrieveContents(normalizedQuestion, effectiveMaxResults, scopeId).stream()
+                .map(content -> toRankedMatch(content, queryTerms))
+                .sorted((a, b) -> Double.compare(b.hybridScore(), a.hybridScore()))
+                .filter(match -> match.hybridScore() >= effectiveThreshold)
+                .toList();
+        List<RankedMatch> uniqueMatches = deduplicateMatches(
+                rankedMatches.stream()
+                        .map(this::resolveCandidateIdentity)
+                        .toList()
+        );
+        if (uniqueMatches.isEmpty()) {
+            return new QueryComputation(
+                    noResultsAnswer,
+                    List.of(),
+                    new QueryExplainability(List.of(), queryTerms, 0.0d)
+            );
+        }
+
+        List<RankedMatch> contextMatches = uniqueMatches.stream()
+                .limit(MAX_CONTEXT_SEGMENTS)
+                .toList();
+        String context = contextMatches.stream()
+                .map(RankedMatch::text)
+                .collect(java.util.stream.Collectors.joining("\n\n"));
+        QueryExplainability explainability = buildExplainability(queryTerms, uniqueMatches);
+        String prompt = String.format(PROMPT_TEMPLATE, context, normalizedQuestion);
+        String answer = generateAnswerWithFallback(prompt, normalizedQuestion, queryTerms, contextMatches);
+        return new QueryComputation(answer, uniqueMatches, explainability);
+    }
+
+    private QueryComputation getOrComputeQueryComputation(QueryCacheKey cacheKey, Supplier<QueryComputation> computer) {
+        long now = System.currentTimeMillis();
+        QueryComputation cached = queryResultCache.get(cacheKey, now);
+        if (cached != null) {
+            return cached;
+        }
+
+        CompletableFuture<QueryComputation> newFuture = new CompletableFuture<>();
+        CompletableFuture<QueryComputation> existingFuture = queryComputationInFlight.putIfAbsent(cacheKey, newFuture);
+        if (existingFuture == null) {
+            try {
+                QueryComputation computed = computer.get();
+                queryResultCache.put(cacheKey, computed, now);
+                newFuture.complete(computed);
+                return computed;
+            } catch (RuntimeException ex) {
+                newFuture.completeExceptionally(ex);
+                throw ex;
+            } catch (Error err) {
+                newFuture.completeExceptionally(err);
+                throw err;
+            } finally {
+                queryComputationInFlight.remove(cacheKey, newFuture);
+            }
+        }
+
+        try {
+            return existingFuture.join();
+        } catch (CompletionException ex) {
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new RuntimeException(cause);
+        }
     }
 
     private List<Content> retrieveContents(String question, int maxResults, String scopeId) {
@@ -800,6 +872,10 @@ public class RagService {
         return Math.max(0.0d, Math.min(1.0d, value));
     }
 
+    private static int toScoreKey(double value) {
+        return (int) Math.round(clampScore(value) * 1000.0d);
+    }
+
     private record RankedMatch(
             String text,
             String source,
@@ -817,6 +893,65 @@ public class RagService {
             List<String> matchedTerms,
             List<String> missingTerms
     ) {
+    }
+
+    private record QueryComputation(
+            String answer,
+            List<RankedMatch> uniqueMatches,
+            QueryExplainability explainability
+    ) {
+    }
+
+    private record QueryCacheKey(
+            String normalizedQuestion,
+            int maxResults,
+            int minScoreKey,
+            String scopeId
+    ) {
+    }
+
+    private record QueryCacheEntry(
+            QueryComputation computation,
+            long cachedAtMillis
+    ) {
+    }
+
+    private static final class QueryResultCache {
+        private final long ttlMillis;
+        private final Map<QueryCacheKey, QueryCacheEntry> entries;
+
+        private QueryResultCache(int maxEntries, long ttlMillis) {
+            int safeMaxEntries = Math.max(1, maxEntries);
+            this.ttlMillis = Math.max(0L, ttlMillis);
+            this.entries = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<QueryCacheKey, QueryCacheEntry> eldest) {
+                    return size() > safeMaxEntries;
+                }
+            });
+        }
+
+        private QueryComputation get(QueryCacheKey key, long nowMillis) {
+            if (ttlMillis <= 0L) {
+                return null;
+            }
+            QueryCacheEntry entry = entries.get(key);
+            if (entry == null) {
+                return null;
+            }
+            if (nowMillis - entry.cachedAtMillis() > ttlMillis) {
+                entries.remove(key);
+                return null;
+            }
+            return entry.computation();
+        }
+
+        private void put(QueryCacheKey key, QueryComputation computation, long nowMillis) {
+            if (ttlMillis <= 0L) {
+                return;
+            }
+            entries.put(key, new QueryCacheEntry(computation, nowMillis));
+        }
     }
 
     private record GuardrailDecision(boolean blocked, String answer) {
