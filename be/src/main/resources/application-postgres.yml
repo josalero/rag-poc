@@ -12,5 +12,3 @@ spring:
 app:
   store:
     type: postgres
-  pgvector:
-    table: document_embeddings

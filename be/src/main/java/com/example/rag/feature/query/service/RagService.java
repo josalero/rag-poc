@@ -1,10 +1,13 @@
 package com.example.rag.feature.query.service;
 
+import com.example.rag.feature.candidate.model.CandidateProfile;
 import com.example.rag.feature.candidate.service.CandidateProfileService;
 import com.example.rag.feature.query.model.QueryExplainability;
 import com.example.rag.feature.query.model.QueryResponse;
 import com.example.rag.feature.feedback.service.QueryFeedbackService;
 import com.example.rag.feature.metrics.service.ObservabilityService;
+import com.example.rag.feature.role.domain.TechnicalRoleCatalog;
+import com.example.rag.feature.role.domain.TechnicalRoleCatalog.RoleDefinition;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.rag.content.Content;
@@ -35,9 +38,12 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Comparator;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.text.Normalizer;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
 
@@ -51,6 +57,8 @@ public class RagService {
     private static final int DEFAULT_MAX_PAGE_SIZE = 100;
     private static final int DEFAULT_QUERY_CACHE_MAX_ENTRIES = 256;
     private static final long DEFAULT_QUERY_CACHE_TTL_MILLIS = 15_000L;
+    private static final int CANDIDATE_EXISTENCE_MAX_RESULTS = 50;
+    private static final int CANDIDATE_FILTER_MAX_RESULTS = 100;
     private static final int MAX_CONTEXT_SEGMENTS = 20;
     private static final int MAX_EXPLAINABILITY_TERMS = 8;
     private static final double DEFAULT_MIN_SCORE = 0.75d;
@@ -60,6 +68,19 @@ public class RagService {
             "I couldn't find relevant information in the ingested resumes.";
     private static final String FAIRNESS_GUARDRAIL_MESSAGE = "I can't rank or filter candidates by protected attributes (such as age, gender, race, ethnicity, religion, disability, marital status, or nationality). Please ask using job-relevant skills, experience, and responsibilities.";
     private static final String SECURITY_GUARDRAIL_MESSAGE = "I can't help with requests to bypass instructions, reveal hidden prompts, or expose secrets/credentials. Ask about candidate skills, role fit, and experience instead.";
+    private static final String CANDIDATE_EXISTENCE_INTENT_PROMPT = """
+            You are an intent parser for a candidate search system.
+            Determine whether the user asks if a specific person exists in candidate records.
+            Return ONLY valid JSON with this exact schema:
+            {"isExistenceQuery":true,"targetName":"<full person name>"}
+            or
+            {"isExistenceQuery":false,"targetName":""}
+            Rules:
+            - Extract only person names.
+            - If the question is about skills, roles, location, years, or ranking, return isExistenceQuery=false.
+            - If uncertain, return isExistenceQuery=false.
+            User question: %s
+            """;
     private static final String PROMPT_TEMPLATE = """
         Answer the question based only on the following resume excerpts.
         List people or skills mentioned when relevant. If the context does not contain \
@@ -92,6 +113,19 @@ public class RagService {
             "need", "needs", "want", "wants", "looking", "search", "find", "show", "list",
             "candidate", "candidates", "profile", "profiles", "resume", "resumes"
     );
+
+    private static final Set<String> CANDIDATE_EXISTENCE_NOISE_TERMS = Set.of(
+            "candidate", "candidates", "database", "db", "system", "pool", "our", "the", "in", "on",
+            "skills", "skill", "role", "roles", "engineer", "developer", "qa", "devops", "manager"
+    );
+
+    private static final Set<String> CANDIDATE_FILTER_INTENT_TERMS = Set.of(
+            "candidate", "candidates", "profile", "profiles", "who", "which", "list", "show", "find", "need", "looking"
+    );
+    private static final Set<String> LOCATION_STOP_TERMS = Set.of(
+            "database", "db", "system", "candidate", "candidates", "our", "the", "with", "who", "that", "have", "has"
+    );
+    private static final List<RoleDefinition> ROLE_DEFINITIONS = TechnicalRoleCatalog.roleDefinitions();
 
     private static final Set<String> SENSITIVE_ATTRIBUTE_TERMS = Set.of(
             "age", "gender", "sex", "race", "ethnicity", "religion", "disabled", "disability",
@@ -126,6 +160,54 @@ public class RagService {
     private static final List<Pattern> SECRET_EXFILTRATION_PATTERNS = List.of(
             Pattern.compile("\\b(reveal|show|print|dump|display|leak|expose|return)\\b.{0,120}\\b(api key|access token|secret key|private key|password|credential|openai_api_key|openai key|\\.env|environment variable)\\b"),
             Pattern.compile("\\b(api key|access token|secret key|private key|password|credential|openai_api_key|openai key|\\.env|environment variable)\\b.{0,120}\\b(reveal|show|print|dump|display|leak|expose|return)\\b")
+    );
+
+    private static final Pattern CANDIDATE_EXISTENCE_DATABASE_PATTERN = Pattern.compile(
+            "^\\s*(?:is|are|do\\s+we\\s+have|does\\s+our\\s+database\\s+have|can\\s+you\\s+find)\\s+(.+?)\\s+(?:in|on)\\s+(?:our\\s+)?(?:database|db|system|candidate\\s+database|talent\\s+pool|records?|candidate\\s+records?|indexed\\s+records?)\\s*\\??\\s*$",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern CANDIDATE_EXISTENCE_HAVE_PATTERN = Pattern.compile(
+            "^\\s*(?:do\\s+we\\s+have|can\\s+you\\s+find)\\s+(.+?)\\s*\\??\\s*$",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern CANDIDATE_EXISTENCE_START_PATTERN = Pattern.compile(
+            "^\\s*(?:is|are|do\\s+we\\s+have|does\\s+our\\s+\\w+\\s+have|does\\s+.+\\s+exist|can\\s+you\\s+(?:find|check|verify)|could\\s+you\\s+(?:find|check|verify)|is\\s+there|are\\s+there|have\\s+we\\s+ingested|did\\s+we\\s+ingest)\\b",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final List<Pattern> CANDIDATE_EXISTENCE_REFERENCE_PATTERNS = List.of(
+            Pattern.compile("\\b(database|db|system|records?|datastore|index|indexed)\\b"),
+            Pattern.compile("\\b(candidate\\s+records?|talent\\s+pool|on\\s+file)\\b")
+    );
+    private static final Pattern JSON_TARGET_NAME_PATTERN = Pattern.compile(
+            "\"targetName\"\\s*:\\s*\"([^\"]*)\"",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern JSON_EXISTENCE_FLAG_PATTERN = Pattern.compile(
+            "\"isExistenceQuery\"\\s*:\\s*(true|false)",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern CHAT_CURRENT_QUESTION_PATTERN = Pattern.compile(
+            "(?is)\\bcurrent\\s+question\\s*:\\s*(.+)$"
+    );
+    private static final Pattern YEARS_MIN_PATTERN = Pattern.compile(
+            "(?:at\\s+least|min(?:imum)?|>=|over|more\\s+than)\\s*(\\d{1,2})\\s*\\+?\\s*years?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern YEARS_MAX_PATTERN = Pattern.compile(
+            "(?:at\\s+most|max(?:imum)?|<=|under|less\\s+than)\\s*(\\d{1,2})\\s*\\+?\\s*years?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern YEARS_GENERIC_PATTERN = Pattern.compile(
+            "(\\d{1,2})\\s*\\+?\\s*years?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern LOCATION_PATTERN = Pattern.compile(
+            "(?:located\\s+in|based\\s+in|from|in)\\s+([a-zA-Z][a-zA-Z\\s,.'-]{1,40})",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern NAMED_PATTERN = Pattern.compile(
+            "(?:named|name|candidate)\\s+([a-zA-Z][a-zA-Z\\s.'-]{2,60})",
+            Pattern.CASE_INSENSITIVE
     );
 
     private final EmbeddingStore<TextSegment> embeddingStore;
@@ -328,6 +410,7 @@ public class RagService {
                     : DEFAULT_PAGE_SIZE;
 
             String normalizedQuestion = question == null ? "" : question.trim();
+            String intentQuestion = extractIntentQuestion(normalizedQuestion);
             GuardrailDecision guardrailDecision = evaluateGuardrails(normalizedQuestion);
             if (guardrailDecision.blocked()) {
                 QueryResponse response = QueryResponse.of(
@@ -339,6 +422,30 @@ public class RagService {
                         new QueryExplainability(List.of(), List.of(), 0.0d));
                 recordQuerySuccess(startedAt, 0);
                 return response;
+            }
+
+            CandidateExistenceIntent candidateExistenceIntent = resolveCandidateExistenceIntent(intentQuestion);
+            if (candidateExistenceIntent != null && candidateProfileService != null) {
+                QueryResponse response = answerCandidateExistence(
+                        candidateExistenceIntent,
+                        effectivePage,
+                        effectivePageSize
+                );
+                recordQuerySuccess(startedAt, response.totalSources());
+                return response;
+            }
+
+            CandidateFilterIntent candidateFilterIntent = parseCandidateFilterIntent(intentQuestion);
+            if (candidateFilterIntent != null && candidateProfileService != null) {
+                QueryResponse response = answerCandidateFilterIntent(
+                        candidateFilterIntent,
+                        effectivePage,
+                        effectivePageSize
+                );
+                if (response.totalSources() > 0 || candidateFilterIntent.hasHardConstraints()) {
+                    recordQuerySuccess(startedAt, response.totalSources());
+                    return response;
+                }
             }
 
             String cleanedScopeId = cleanNullable(scopeId);
@@ -477,6 +584,774 @@ public class RagService {
             }
             throw new RuntimeException(cause);
         }
+    }
+
+    private QueryResponse answerCandidateExistence(
+            CandidateExistenceIntent intent,
+            int page,
+            int pageSize) {
+        List<CandidateMatch> matches = findCandidateMatchesByName(intent.targetName(), CANDIDATE_EXISTENCE_MAX_RESULTS);
+        int total = matches.size();
+        int startIndex = Math.min((page - 1) * pageSize, total);
+        int endIndex = Math.min(startIndex + pageSize, total);
+        List<CandidateMatch> pageMatches = startIndex < endIndex ? matches.subList(startIndex, endIndex) : List.of();
+
+        List<QueryResponse.SourceSegment> sources = new ArrayList<>();
+        for (int i = 0; i < pageMatches.size(); i++) {
+            CandidateMatch match = pageMatches.get(i);
+            CandidateProfile candidate = match.candidate();
+            String roles = candidate.suggestedRoles() != null && !candidate.suggestedRoles().isEmpty()
+                    ? String.join(", ", candidate.suggestedRoles().stream().limit(3).toList())
+                    : "-";
+            String skills = candidate.significantSkills() != null && !candidate.significantSkills().isEmpty()
+                    ? String.join(", ", candidate.significantSkills().stream().limit(6).toList())
+                    : "-";
+            String details = "Candidate: " + candidate.displayName()
+                    + "\nLocation: " + safeText(candidate.location())
+                    + "\nEstimated years: " + (candidate.estimatedYearsExperience() != null ? candidate.estimatedYearsExperience() : "-")
+                    + "\nSuggested roles: " + roles
+                    + "\nTop skills: " + skills;
+
+            sources.add(new QueryResponse.SourceSegment(
+                    details,
+                    safeText(candidate.sourceFilename()),
+                    match.score(),
+                    startIndex + i + 1,
+                    safeText(candidate.id()),
+                    match.score(),
+                    1.0d,
+                    intent.queryTokens(),
+                    List.of()
+            ));
+        }
+
+        String answer = total > 0
+                ? buildCandidateExistencePositiveAnswer(intent.targetName(), matches)
+                : buildCandidateExistenceNegativeAnswer(intent.targetName());
+        double confidence = total > 0 ? matches.getFirst().score() : 0.0d;
+        QueryExplainability explainability = new QueryExplainability(
+                intent.queryTokens(),
+                List.of(),
+                clampScore(confidence)
+        );
+        return QueryResponse.of(answer, sources, page, pageSize, total, explainability);
+    }
+
+    private List<CandidateMatch> findCandidateMatchesByName(String targetName, int limit) {
+        String normalizedTarget = normalizePersonName(targetName);
+        List<String> targetTokens = personNameTokens(normalizedTarget);
+        if (targetTokens.isEmpty()) {
+            return List.of();
+        }
+
+        List<CandidateMatch> matches = new ArrayList<>();
+        for (CandidateProfile candidate : candidateProfileService.allCandidates()) {
+            if (candidate == null || candidate.displayName() == null || candidate.displayName().isBlank()) {
+                continue;
+            }
+            double score = scoreCandidateName(candidate.displayName(), normalizedTarget, targetTokens);
+            if (score <= 0.0d) {
+                continue;
+            }
+            matches.add(new CandidateMatch(candidate, score));
+        }
+        return matches.stream()
+                .sorted((a, b) -> {
+                    int scoreCompare = Double.compare(b.score(), a.score());
+                    if (scoreCompare != 0) {
+                        return scoreCompare;
+                    }
+                    return a.candidate().displayName().compareToIgnoreCase(b.candidate().displayName());
+                })
+                .limit(Math.max(1, limit))
+                .toList();
+    }
+
+    private static double scoreCandidateName(
+            String candidateDisplayName,
+            String normalizedTarget,
+            List<String> targetTokens) {
+        String normalizedCandidate = normalizePersonName(candidateDisplayName);
+        List<String> candidateTokens = personNameTokens(normalizedCandidate);
+        if (candidateTokens.isEmpty()) {
+            return 0.0d;
+        }
+
+        int exactMatches = 0;
+        int prefixMatches = 0;
+        for (String token : targetTokens) {
+            if (candidateTokens.contains(token)) {
+                exactMatches++;
+                continue;
+            }
+            boolean prefixMatch = candidateTokens.stream().anyMatch(candidateToken ->
+                    candidateToken.startsWith(token) || token.startsWith(candidateToken));
+            if (prefixMatch) {
+                prefixMatches++;
+            }
+        }
+
+        boolean containsFullTarget = normalizedCandidate.contains(normalizedTarget);
+        if (!containsFullTarget && exactMatches == 0 && prefixMatches < Math.max(1, targetTokens.size() - 1)) {
+            return 0.0d;
+        }
+
+        double tokenCoverage = (exactMatches + (0.5d * prefixMatches)) / Math.max(1.0d, targetTokens.size());
+        double score = 0.45d + (containsFullTarget ? 0.35d : 0.0d) + (0.20d * tokenCoverage);
+        return clampScore(score);
+    }
+
+    private static String buildCandidateExistencePositiveAnswer(String requestedName, List<CandidateMatch> matches) {
+        CandidateMatch top = matches.getFirst();
+        List<String> topNames = matches.stream()
+                .limit(3)
+                .map(match -> match.candidate().displayName())
+                .toList();
+        return "ANSWER:\n"
+                + "Yes, \"" + requestedName + "\" appears in the candidate database.\n\n"
+                + "KEY_FINDINGS:\n"
+                + "- Top match: " + top.candidate().displayName() + ".\n"
+                + "- Matching candidates found: " + matches.size() + " (" + String.join(", ", topNames) + ").\n\n"
+                + "LIMITATIONS:\n"
+                + "- Name matching is heuristic and may include similarly named profiles.\n\n"
+                + "NEXT_STEPS:\n"
+                + "- Open the candidate profile and verify contact details, skills, and role alignment.";
+    }
+
+    private static String buildCandidateExistenceNegativeAnswer(String requestedName) {
+        return "ANSWER:\n"
+                + "No, I could not find a candidate named \"" + requestedName + "\" in the current indexed database.\n\n"
+                + "KEY_FINDINGS:\n"
+                + "- No high-confidence name matches were found.\n"
+                + "- This may indicate the resume has not been ingested yet or the name appears in a variant form.\n\n"
+                + "LIMITATIONS:\n"
+                + "- Matching uses normalized name tokens and may miss uncommon formatting variants.\n\n"
+                + "NEXT_STEPS:\n"
+                + "- Try a partial name, alternative spelling, or re-run ingestion for the expected resume.";
+    }
+
+    private QueryResponse answerCandidateFilterIntent(
+            CandidateFilterIntent intent,
+            int page,
+            int pageSize) {
+        List<CandidateFilterMatch> ranked = rankCandidatesForIntent(intent, CANDIDATE_FILTER_MAX_RESULTS);
+        int total = ranked.size();
+        int startIndex = Math.min((page - 1) * pageSize, total);
+        int endIndex = Math.min(startIndex + pageSize, total);
+        List<CandidateFilterMatch> pageMatches = startIndex < endIndex ? ranked.subList(startIndex, endIndex) : List.of();
+
+        List<QueryResponse.SourceSegment> sources = new ArrayList<>();
+        for (int i = 0; i < pageMatches.size(); i++) {
+            CandidateFilterMatch match = pageMatches.get(i);
+            CandidateProfile candidate = match.candidate();
+            String details = buildCandidateFilterDetails(candidate, match);
+            sources.add(new QueryResponse.SourceSegment(
+                    details,
+                    safeText(candidate.sourceFilename()),
+                    match.score(),
+                    startIndex + i + 1,
+                    safeText(candidate.id()),
+                    match.score(),
+                    match.keywordScore(),
+                    match.matchedCriteria(),
+                    List.of()
+            ));
+        }
+
+        String answer = total > 0
+                ? buildCandidateFilterPositiveAnswer(intent, ranked)
+                : buildCandidateFilterNegativeAnswer(intent);
+        double confidence = total > 0 ? ranked.getFirst().score() : 0.0d;
+        QueryExplainability explainability = new QueryExplainability(
+                intent.queryTerms(),
+                List.of(),
+                clampScore(confidence)
+        );
+        return QueryResponse.of(answer, sources, page, pageSize, total, explainability);
+    }
+
+    private List<CandidateFilterMatch> rankCandidatesForIntent(CandidateFilterIntent intent, int limit) {
+        List<CandidateFilterMatch> matches = new ArrayList<>();
+        for (CandidateProfile candidate : candidateProfileService.allCandidates()) {
+            CandidateFilterMatch match = scoreCandidateForIntent(candidate, intent);
+            if (match != null) {
+                matches.add(match);
+            }
+        }
+        return matches.stream()
+                .sorted(Comparator.comparingDouble(CandidateFilterMatch::score).reversed()
+                        .thenComparing(match -> safeText(match.candidate().displayName()), String.CASE_INSENSITIVE_ORDER))
+                .limit(Math.max(1, limit))
+                .toList();
+    }
+
+    private CandidateFilterMatch scoreCandidateForIntent(CandidateProfile candidate, CandidateFilterIntent intent) {
+        if (candidate == null) {
+            return null;
+        }
+        String corpus = buildCandidateCorpus(candidate);
+        List<String> matchedCriteria = new ArrayList<>();
+
+        if (!intent.requiredSkills().isEmpty()) {
+            boolean allSkillsMatched = true;
+            for (String skill : intent.requiredSkills()) {
+                if (!candidateHasSkill(candidate, corpus, skill)) {
+                    allSkillsMatched = false;
+                    break;
+                }
+                matchedCriteria.add("skill:" + skill);
+            }
+            if (!allSkillsMatched) {
+                return null;
+            }
+        }
+
+        if (!intent.requiredRoles().isEmpty()) {
+            List<String> matchedRoles = intent.requiredRoles().stream()
+                    .filter(role -> candidateMatchesRole(candidate, role))
+                    .toList();
+            if (matchedRoles.isEmpty()) {
+                return null;
+            }
+            matchedRoles.forEach(role -> matchedCriteria.add("role:" + role));
+        }
+
+        if (intent.locationFilter() != null) {
+            String location = normalize(candidate.location());
+            String targetLocation = normalize(intent.locationFilter());
+            if (location.isBlank() || !location.contains(targetLocation)) {
+                return null;
+            }
+            matchedCriteria.add("location:" + intent.locationFilter());
+        }
+
+        if (intent.minYears() != null || intent.maxYears() != null) {
+            Integer years = candidate.estimatedYearsExperience();
+            if (years == null) {
+                return null;
+            }
+            if (intent.minYears() != null && years < intent.minYears()) {
+                return null;
+            }
+            if (intent.maxYears() != null && years > intent.maxYears()) {
+                return null;
+            }
+            matchedCriteria.add("years:" + years);
+        }
+
+        if (!intent.nameTokens().isEmpty()) {
+            if (!candidateMatchesNameTokens(candidate, intent.nameTokens())) {
+                return null;
+            }
+            matchedCriteria.add("name");
+        }
+
+        double keywordScore = scoreTermOverlap(corpus, intent.queryTerms()).keywordScore();
+        double yearsSignal = candidate.estimatedYearsExperience() != null
+                ? clampScore(candidate.estimatedYearsExperience() / 15.0d)
+                : 0.2d;
+        double score = clampScore(0.55d + (0.30d * keywordScore) + (0.15d * yearsSignal));
+        return new CandidateFilterMatch(candidate, score, clampScore(keywordScore), List.copyOf(matchedCriteria));
+    }
+
+    private static boolean candidateHasSkill(CandidateProfile candidate, String corpus, String skill) {
+        if (candidate == null || skill == null || skill.isBlank()) {
+            return false;
+        }
+        String canonicalSkill = TechnicalRoleCatalog.normalizeSkill(skill);
+        boolean inSkillLists = candidate.skills() != null && candidate.skills().stream()
+                .map(TechnicalRoleCatalog::normalizeSkill)
+                .anyMatch(s -> s.equals(canonicalSkill));
+        if (inSkillLists) {
+            return true;
+        }
+        boolean inSignificantSkills = candidate.significantSkills() != null && candidate.significantSkills().stream()
+                .map(TechnicalRoleCatalog::normalizeSkill)
+                .anyMatch(s -> s.equals(canonicalSkill));
+        if (inSignificantSkills) {
+            return true;
+        }
+        return TechnicalRoleCatalog.containsSkillTerm(corpus, canonicalSkill);
+    }
+
+    private static boolean candidateMatchesRole(CandidateProfile candidate, String requestedRole) {
+        if (candidate == null || requestedRole == null || requestedRole.isBlank()) {
+            return false;
+        }
+        String normalizedRequested = normalize(requestedRole);
+        if (normalizedRequested.isBlank()) {
+            return false;
+        }
+        if (candidate.suggestedRoles() == null || candidate.suggestedRoles().isEmpty()) {
+            return false;
+        }
+        for (String role : candidate.suggestedRoles()) {
+            String normalizedRole = normalize(role);
+            if (normalizedRole.contains(normalizedRequested) || normalizedRequested.contains(normalizedRole)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean candidateMatchesNameTokens(CandidateProfile candidate, List<String> nameTokens) {
+        if (candidate == null || nameTokens == null || nameTokens.isEmpty()) {
+            return false;
+        }
+        String normalizedName = normalizePersonName(candidate.displayName());
+        List<String> candidateTokens = personNameTokens(normalizedName);
+        if (candidateTokens.isEmpty()) {
+            return false;
+        }
+        for (String token : nameTokens) {
+            boolean matched = candidateTokens.stream().anyMatch(candidateToken ->
+                    candidateToken.equals(token) || candidateToken.startsWith(token) || token.startsWith(candidateToken));
+            if (!matched) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String buildCandidateFilterDetails(CandidateProfile candidate, CandidateFilterMatch match) {
+        String roles = candidate.suggestedRoles() != null && !candidate.suggestedRoles().isEmpty()
+                ? String.join(", ", candidate.suggestedRoles().stream().limit(3).toList())
+                : "-";
+        String skills = candidate.significantSkills() != null && !candidate.significantSkills().isEmpty()
+                ? String.join(", ", candidate.significantSkills().stream().limit(6).toList())
+                : "-";
+        String years = candidate.estimatedYearsExperience() != null ? String.valueOf(candidate.estimatedYearsExperience()) : "-";
+        return "Candidate: " + safeText(candidate.displayName())
+                + "\nLocation: " + safeText(candidate.location())
+                + "\nEstimated years: " + years
+                + "\nSuggested roles: " + roles
+                + "\nTop skills: " + skills
+                + "\nMatched criteria: " + (match.matchedCriteria().isEmpty() ? "-" : String.join(", ", match.matchedCriteria()));
+    }
+
+    private static String buildCandidateFilterPositiveAnswer(CandidateFilterIntent intent, List<CandidateFilterMatch> matches) {
+        List<String> topNames = matches.stream()
+                .limit(3)
+                .map(match -> safeText(match.candidate().displayName()))
+                .toList();
+        return "ANSWER:\n"
+                + "Found " + matches.size() + " candidate(s) matching your criteria.\n\n"
+                + "KEY_FINDINGS:\n"
+                + "- Applied filters: " + buildFilterSummary(intent) + ".\n"
+                + "- Top matches: " + String.join(", ", topNames) + ".\n\n"
+                + "LIMITATIONS:\n"
+                + "- Results depend on extracted candidate metadata quality (skills, roles, location, and years).\n\n"
+                + "NEXT_STEPS:\n"
+                + "- Open the candidate profiles to verify fit details and compare source resumes.";
+    }
+
+    private static String buildCandidateFilterNegativeAnswer(CandidateFilterIntent intent) {
+        return "ANSWER:\n"
+                + "No candidates matched your requested criteria.\n\n"
+                + "KEY_FINDINGS:\n"
+                + "- Applied filters: " + buildFilterSummary(intent) + ".\n"
+                + "- No profiles satisfied all required constraints.\n\n"
+                + "LIMITATIONS:\n"
+                + "- Some resumes may have incomplete extracted metadata.\n\n"
+                + "NEXT_STEPS:\n"
+                + "- Relax one filter (skills, years, role, or location) and retry.";
+    }
+
+    private static String buildFilterSummary(CandidateFilterIntent intent) {
+        List<String> parts = new ArrayList<>();
+        if (!intent.requiredSkills().isEmpty()) {
+            parts.add("skills=" + String.join(", ", intent.requiredSkills()));
+        }
+        if (!intent.requiredRoles().isEmpty()) {
+            parts.add("roles=" + String.join(", ", intent.requiredRoles()));
+        }
+        if (intent.locationFilter() != null) {
+            parts.add("location=" + intent.locationFilter());
+        }
+        if (intent.minYears() != null || intent.maxYears() != null) {
+            if (intent.minYears() != null && intent.maxYears() != null) {
+                parts.add("years=" + intent.minYears() + "-" + intent.maxYears());
+            } else if (intent.minYears() != null) {
+                parts.add("years>=" + intent.minYears());
+            } else {
+                parts.add("years<=" + intent.maxYears());
+            }
+        }
+        if (!intent.nameTokens().isEmpty()) {
+            parts.add("name=" + String.join(" ", intent.nameTokens()));
+        }
+        return parts.isEmpty() ? "none" : String.join("; ", parts);
+    }
+
+    private static CandidateFilterIntent parseCandidateFilterIntent(String question) {
+        if (question == null || question.isBlank()) {
+            return null;
+        }
+        String normalizedQuestion = normalize(question);
+        List<String> requiredSkills = extractRequestedSkills(question);
+        List<String> requiredRoles = extractRequestedRoles(normalizedQuestion);
+        String locationFilter = extractLocationFilter(question);
+        Integer minYears = extractMinYears(question);
+        Integer maxYears = extractMaxYears(question);
+        List<String> nameTokens = extractNameTokens(question);
+        List<String> queryTerms = extractQueryTerms(question);
+
+        boolean hasFilterSignal = !requiredSkills.isEmpty()
+                || !requiredRoles.isEmpty()
+                || locationFilter != null
+                || minYears != null
+                || maxYears != null
+                || !nameTokens.isEmpty();
+        if (!hasFilterSignal) {
+            return null;
+        }
+
+        boolean hasCandidateContext = containsAnyToken(normalizedQuestion, CANDIDATE_FILTER_INTENT_TERMS)
+                || normalizedQuestion.contains("experience")
+                || normalizedQuestion.contains("years");
+        if (!hasCandidateContext) {
+            return null;
+        }
+
+        return new CandidateFilterIntent(
+                List.copyOf(requiredSkills),
+                List.copyOf(requiredRoles),
+                locationFilter,
+                minYears,
+                maxYears,
+                List.copyOf(nameTokens),
+                List.copyOf(queryTerms)
+        );
+    }
+
+    private static List<String> extractRequestedSkills(String question) {
+        String canonicalized = TechnicalRoleCatalog.canonicalizeSkillText(question);
+        LinkedHashSet<String> skills = new LinkedHashSet<>();
+        for (String skill : TechnicalRoleCatalog.canonicalSkills()) {
+            if (TechnicalRoleCatalog.containsSkillTerm(canonicalized, skill)) {
+                skills.add(skill);
+            }
+        }
+        return List.copyOf(skills);
+    }
+
+    private static List<String> extractRequestedRoles(String normalizedQuestion) {
+        LinkedHashSet<String> roles = new LinkedHashSet<>();
+        for (RoleDefinition definition : ROLE_DEFINITIONS) {
+            String normalizedRole = normalize(definition.title());
+            if (!normalizedRole.isBlank() && normalizedQuestion.contains(normalizedRole)) {
+                roles.add(definition.title());
+            }
+        }
+        if (normalizedQuestion.contains("qa") || normalizedQuestion.contains("test engineer") || normalizedQuestion.contains("sdet")) {
+            roles.add(TechnicalRoleCatalog.QA_ROLE_TITLE);
+        }
+        if (normalizedQuestion.contains("devops") || normalizedQuestion.contains("platform engineer") || normalizedQuestion.contains("sre")) {
+            roles.add("DevOps / Platform Engineer");
+        }
+        if (normalizedQuestion.contains("backend engineer") || normalizedQuestion.contains("backend developer")) {
+            roles.add("Backend Engineer");
+        }
+        if (normalizedQuestion.contains("frontend engineer") || normalizedQuestion.contains("frontend developer")) {
+            roles.add("Frontend Engineer");
+        }
+        if (normalizedQuestion.contains("full stack") || normalizedQuestion.contains("full-stack") || normalizedQuestion.contains("fullstack")) {
+            roles.add("Full-Stack Engineer");
+        }
+        if (normalizedQuestion.contains("tech lead") || normalizedQuestion.contains("team lead")) {
+            roles.add(TechnicalRoleCatalog.TECH_LEAD_ROLE_TITLE);
+        }
+        if (normalizedQuestion.contains("engineering manager") || normalizedQuestion.contains("people manager")) {
+            roles.add(TechnicalRoleCatalog.ENGINEERING_MANAGER_ROLE_TITLE);
+        }
+        if (normalizedQuestion.contains("ai engineer") || normalizedQuestion.contains("llm engineer") || normalizedQuestion.contains("rag engineer")) {
+            roles.add("AI Engineer (LLM/RAG)");
+        }
+        return List.copyOf(roles);
+    }
+
+    private static String extractLocationFilter(String question) {
+        java.util.regex.Matcher matcher = LOCATION_PATTERN.matcher(question);
+        while (matcher.find()) {
+            String raw = matcher.group(1);
+            if (raw == null || raw.isBlank()) {
+                continue;
+            }
+            String cleaned = raw.replaceAll("[?.!]+$", "").trim();
+            if (cleaned.length() < 3) {
+                continue;
+            }
+            List<String> words = java.util.Arrays.stream(cleaned.toLowerCase(Locale.ROOT).split("[^a-z]+"))
+                    .filter(word -> !word.isBlank())
+                    .toList();
+            if (words.isEmpty()) {
+                continue;
+            }
+            boolean hasStopWord = words.stream().anyMatch(LOCATION_STOP_TERMS::contains);
+            if (hasStopWord) {
+                continue;
+            }
+            return cleaned;
+        }
+        return null;
+    }
+
+    private static Integer extractMinYears(String question) {
+        java.util.regex.Matcher explicit = YEARS_MIN_PATTERN.matcher(question);
+        if (explicit.find()) {
+            return parsePositiveInt(explicit.group(1));
+        }
+        java.util.regex.Matcher generic = YEARS_GENERIC_PATTERN.matcher(question);
+        if (generic.find()) {
+            return parsePositiveInt(generic.group(1));
+        }
+        return null;
+    }
+
+    private static Integer extractMaxYears(String question) {
+        java.util.regex.Matcher explicit = YEARS_MAX_PATTERN.matcher(question);
+        if (explicit.find()) {
+            return parsePositiveInt(explicit.group(1));
+        }
+        return null;
+    }
+
+    private static Integer parsePositiveInt(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            int value = Integer.parseInt(raw.trim());
+            return value > 0 ? value : null;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private static List<String> extractNameTokens(String question) {
+        java.util.regex.Matcher matcher = NAMED_PATTERN.matcher(question);
+        if (!matcher.find()) {
+            return List.of();
+        }
+        String raw = matcher.group(1);
+        if (raw == null || raw.isBlank()) {
+            return List.of();
+        }
+        String cleaned = raw.replaceAll("[?.!]+$", "").trim();
+        if (!looksLikeCandidateNameTarget(cleaned)) {
+            return List.of();
+        }
+        return personNameTokens(normalizePersonName(cleaned));
+    }
+
+    private static String buildCandidateCorpus(CandidateProfile candidate) {
+        StringBuilder sb = new StringBuilder();
+        appendField(sb, candidate.displayName());
+        appendField(sb, candidate.location());
+        if (candidate.skills() != null) {
+            candidate.skills().forEach(skill -> appendField(sb, skill));
+        }
+        if (candidate.significantSkills() != null) {
+            candidate.significantSkills().forEach(skill -> appendField(sb, skill));
+        }
+        if (candidate.suggestedRoles() != null) {
+            candidate.suggestedRoles().forEach(role -> appendField(sb, role));
+        }
+        appendField(sb, candidate.preview());
+        return TechnicalRoleCatalog.canonicalizeSkillText(sb.toString());
+    }
+
+    private static void appendField(StringBuilder sb, String value) {
+        if (value == null || value.isBlank()) {
+            return;
+        }
+        if (sb.length() > 0) {
+            sb.append(' ');
+        }
+        sb.append(value.trim());
+    }
+
+    private static CandidateExistenceIntent parseCandidateExistenceIntent(String question) {
+        if (question == null || question.isBlank()) {
+            return null;
+        }
+        String compact = question.replace('\n', ' ').trim();
+        String target = extractExistenceTarget(compact, CANDIDATE_EXISTENCE_DATABASE_PATTERN);
+        if (target == null) {
+            target = extractExistenceTarget(compact, CANDIDATE_EXISTENCE_HAVE_PATTERN);
+        }
+        if (target == null) {
+            return null;
+        }
+        target = target.replaceAll("^[`\"'\\s]+|[`\"'?.!,\\s]+$", "").trim();
+        if (!looksLikeCandidateNameTarget(target)) {
+            return null;
+        }
+        List<String> tokens = personNameTokens(normalizePersonName(target));
+        return tokens.isEmpty() ? null : new CandidateExistenceIntent(target, tokens);
+    }
+
+    private static String extractIntentQuestion(String question) {
+        if (question == null || question.isBlank()) {
+            return "";
+        }
+        java.util.regex.Matcher matcher = CHAT_CURRENT_QUESTION_PATTERN.matcher(question);
+        if (!matcher.find()) {
+            return question.trim();
+        }
+        String extracted = matcher.group(1);
+        if (extracted == null || extracted.isBlank()) {
+            return question.trim();
+        }
+        return extracted.trim();
+    }
+
+    private CandidateExistenceIntent resolveCandidateExistenceIntent(String question) {
+        CandidateExistenceIntent deterministic = parseCandidateExistenceIntent(question);
+        if (deterministic != null) {
+            return deterministic;
+        }
+        if (candidateProfileService == null || chatModel == null || !mayBeCandidateExistenceQuestion(question)) {
+            return null;
+        }
+        return parseCandidateExistenceIntentWithLlm(question);
+    }
+
+    private CandidateExistenceIntent parseCandidateExistenceIntentWithLlm(String question) {
+        String escapedQuestion = question == null
+                ? "\"\""
+                : "\"" + question.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+        String prompt = CANDIDATE_EXISTENCE_INTENT_PROMPT.formatted(escapedQuestion);
+        try {
+            String raw = chatModel.chat(prompt);
+            String response = stripCodeFence(raw);
+            if (response.isBlank()) {
+                return null;
+            }
+            Boolean existenceQuery = parseJsonBoolean(response, JSON_EXISTENCE_FLAG_PATTERN);
+            String extractedName = parseJsonString(response, JSON_TARGET_NAME_PATTERN);
+            if (Boolean.FALSE.equals(existenceQuery)) {
+                return null;
+            }
+            if (extractedName == null || extractedName.isBlank()) {
+                if (Boolean.TRUE.equals(existenceQuery) && looksLikeCandidateNameTarget(response)) {
+                    extractedName = response;
+                } else {
+                    return null;
+                }
+            }
+            String cleanedTarget = extractedName.replaceAll("^[`\"'\\s]+|[`\"'?.!,\\s]+$", "").trim();
+            if (!looksLikeCandidateNameTarget(cleanedTarget)) {
+                return null;
+            }
+            List<String> tokens = personNameTokens(normalizePersonName(cleanedTarget));
+            return tokens.isEmpty() ? null : new CandidateExistenceIntent(cleanedTarget, tokens);
+        } catch (RuntimeException ex) {
+            log.debug("LLM existence intent fallback failed: {}", ex.getMessage());
+            return null;
+        }
+    }
+
+    private static String extractExistenceTarget(String question, Pattern pattern) {
+        java.util.regex.Matcher matcher = pattern.matcher(question);
+        if (!matcher.matches()) {
+            return null;
+        }
+        String target = matcher.group(1);
+        return target != null ? target.trim() : null;
+    }
+
+    private static boolean mayBeCandidateExistenceQuestion(String question) {
+        if (question == null || question.isBlank()) {
+            return false;
+        }
+        String normalized = normalize(question);
+        if (!CANDIDATE_EXISTENCE_START_PATTERN.matcher(normalized).find()) {
+            return false;
+        }
+        return matchesAnyPattern(normalized, CANDIDATE_EXISTENCE_REFERENCE_PATTERNS);
+    }
+
+    private static String stripCodeFence(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String trimmed = raw.trim();
+        if (!trimmed.startsWith("```")) {
+            return trimmed;
+        }
+        String withoutStart = trimmed.replaceFirst("^```[a-zA-Z0-9_-]*\\s*", "");
+        return withoutStart.replaceFirst("\\s*```\\s*$", "").trim();
+    }
+
+    private static String parseJsonString(String text, Pattern pattern) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        java.util.regex.Matcher matcher = pattern.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        String value = matcher.group(1);
+        return value != null ? value.trim() : null;
+    }
+
+    private static Boolean parseJsonBoolean(String text, Pattern pattern) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        java.util.regex.Matcher matcher = pattern.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        String raw = matcher.group(1);
+        if (raw == null) {
+            return null;
+        }
+        if ("true".equalsIgnoreCase(raw.trim())) {
+            return Boolean.TRUE;
+        }
+        if ("false".equalsIgnoreCase(raw.trim())) {
+            return Boolean.FALSE;
+        }
+        return null;
+    }
+
+    private static boolean looksLikeCandidateNameTarget(String target) {
+        if (target == null || target.isBlank()) {
+            return false;
+        }
+        if (target.contains("@") || target.matches(".*\\d.*")) {
+            return false;
+        }
+        List<String> tokens = personNameTokens(normalizePersonName(target));
+        if (tokens.size() < 2 || tokens.size() > 6) {
+            return false;
+        }
+        return tokens.stream().noneMatch(CANDIDATE_EXISTENCE_NOISE_TERMS::contains);
+    }
+
+    private static String normalizePersonName(String value) {
+        if (value == null) {
+            return "";
+        }
+        String noMarks = Normalizer.normalize(value, Normalizer.Form.NFD).replaceAll("\\p{M}+", "");
+        return noMarks.toLowerCase(Locale.ROOT).replaceAll("[^a-z\\s'-]+", " ").replaceAll("\\s+", " ").trim();
+    }
+
+    private static List<String> personNameTokens(String normalizedName) {
+        if (normalizedName == null || normalizedName.isBlank()) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(normalizedName.split("[^a-z]+"))
+                .map(String::trim)
+                .filter(token -> token.length() >= 2)
+                .distinct()
+                .collect(Collectors.toList());
+    }
+
+    private static String safeText(String value) {
+        return value == null || value.isBlank() ? "-" : value.trim();
     }
 
     private List<Content> retrieveContents(String question, int maxResults, String scopeId) {
@@ -899,6 +1774,44 @@ public class RagService {
             String answer,
             List<RankedMatch> uniqueMatches,
             QueryExplainability explainability
+    ) {
+    }
+
+    private record CandidateExistenceIntent(
+            String targetName,
+            List<String> queryTokens
+    ) {
+    }
+
+    private record CandidateMatch(
+            CandidateProfile candidate,
+            double score
+    ) {
+    }
+
+    private record CandidateFilterIntent(
+            List<String> requiredSkills,
+            List<String> requiredRoles,
+            String locationFilter,
+            Integer minYears,
+            Integer maxYears,
+            List<String> nameTokens,
+            List<String> queryTerms
+    ) {
+        private boolean hasHardConstraints() {
+            return locationFilter != null
+                    || minYears != null
+                    || maxYears != null
+                    || (nameTokens != null && !nameTokens.isEmpty())
+                    || (requiredRoles != null && !requiredRoles.isEmpty());
+        }
+    }
+
+    private record CandidateFilterMatch(
+            CandidateProfile candidate,
+            double score,
+            double keywordScore,
+            List<String> matchedCriteria
     ) {
     }
 

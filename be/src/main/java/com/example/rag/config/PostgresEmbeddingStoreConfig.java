@@ -15,18 +15,36 @@ import javax.sql.DataSource;
 @ConditionalOnProperty(name = "app.store.type", havingValue = "postgres")
 public class PostgresEmbeddingStoreConfig {
 
-    @Value("${app.pgvector.table:document_embeddings}")
-    private String tableName;
+    @Value("${app.pgvector.table:}")
+    private String configuredTableName;
+
+    @Value("${app.embedding.provider:openrouter}")
+    private String embeddingProvider;
 
     @Bean
     EmbeddingStore<TextSegment> embeddingStore(
             DataSource dataSource,
             EmbeddingModel embeddingModel) {
+        String tableName = resolveTableName();
         return PgVectorEmbeddingStore.datasourceBuilder()
                 .datasource(dataSource)
                 .table(tableName)
                 .dimension(embeddingModel.dimension())
                 .createTable(true)
                 .build();
+    }
+
+    private String resolveTableName() {
+        if (configuredTableName != null && !configuredTableName.isBlank()) {
+            return configuredTableName.trim();
+        }
+        return "document_embeddings_" + normalizeProvider(embeddingProvider);
+    }
+
+    private static String normalizeProvider(String provider) {
+        if (provider == null || provider.isBlank()) {
+            return "openrouter";
+        }
+        return provider.trim().toLowerCase().replaceAll("[^a-z0-9]+", "_");
     }
 }

@@ -35,6 +35,8 @@ langchain4j:
 app:
   store:
     type: ${RAG_STORE:memory}
+  embedding:
+    provider: ${EMBEDDING_PROVIDER:local-bge}
   rag:
     max-results: ${RAG_MAX_RESULTS:50}
     max-allowed-results: ${RAG_MAX_ALLOWED_RESULTS:200}

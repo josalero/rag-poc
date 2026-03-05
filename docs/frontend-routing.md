@@ -7,6 +7,7 @@ The frontend uses hash-based routing with a tab-key contract.
 Supported tabs:
 
 - `ingest`
+- `chat`
 - `query`
 - `match`
 - `candidates`
@@ -16,6 +17,7 @@ Supported tabs:
 
 Route forms:
 
+- `#/chat`
 - `#/query`
 - `#/candidates`
 - `#/candidates?candidate=<id>`

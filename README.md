@@ -34,7 +34,7 @@ The backend reads PDFs from a folder (default: `./downloaded-resumes`). Put PDF 
 export OPENROUTER_API_KEY="your-openrouter-api-key"
 ```
 
-**For in-memory (default):** nothing else. Optional: `RESUMES_PATH`, `OPENROUTER_MODEL`, `OPENROUTER_EMBEDDING_MODEL`.
+**For in-memory (default):** nothing else. Optional: `RESUMES_PATH`, `OPENROUTER_MODEL`, `EMBEDDING_PROVIDER`.
 
 **For PostgreSQL:** set `RAG_STORE=postgres` and DB connection:
 
@@ -49,7 +49,8 @@ Optional for all:
 
 - `RESUMES_PATH` – folder with PDF resumes (default: `./downloaded-resumes`)
 - `OPENROUTER_MODEL` – chat model (default: `openai/gpt-4o-mini`)
-- `OPENROUTER_EMBEDDING_MODEL` – embedding model (default: `openai/text-embedding-3-small`)
+- `EMBEDDING_PROVIDER` – embedding provider: `local-bge` (default) or `openrouter`
+- `OPENROUTER_EMBEDDING_MODEL` – embedding model (used only when `EMBEDDING_PROVIDER=openrouter`, default: `openai/text-embedding-3-small`)
 - `OPENROUTER_EMBEDDING_TIMEOUT_SECONDS` – embedding request timeout in seconds (default: `45`)
 - `OPENROUTER_EMBEDDING_MAX_RETRIES` – embedding request retries (default: `0`)
 - `OPENROUTER_EMBEDDING_MAX_SEGMENTS_PER_BATCH` – embedding batch size per request (default: `8`)
@@ -92,7 +93,12 @@ docker exec -it postgres-rag psql -U postgres -d rag -c "CREATE EXTENSION IF NOT
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-Flyway will create the `document_embeddings` table on first startup.
+When using PostgreSQL, LangChain4j creates the embedding table automatically.  
+Default table name is provider-aware:
+- `document_embeddings_local_bge` when `EMBEDDING_PROVIDER=local-bge`
+- `document_embeddings_openrouter` when `EMBEDDING_PROVIDER=openrouter`
+
+You can override with `app.pgvector.table` if needed.
 
 ---
 
@@ -142,7 +148,7 @@ You should get something like `{"documentsProcessed": 5}`. If the folder is empt
 
 **Option A – Web UI**
 
-Open **http://localhost:8084** in a browser. The app uses hash routes and includes pages for **Ingest** (default), **Query**, **Match**, **Candidates**, **Compare**, **Audit**, and **Eval**.
+Open **http://localhost:8084** in a browser. The app uses hash routes and includes pages for **Ingest** (default), **Chat**, **Query**, **Match**, **Candidates**, **Compare**, **Audit**, and **Eval**.
 
 **Option B – API (curl)**
 

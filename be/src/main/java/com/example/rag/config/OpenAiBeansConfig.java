@@ -2,9 +2,11 @@ package com.example.rag.config;
 
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.model.embedding.onnx.bgesmallenv15q.BgeSmallEnV15QuantizedEmbeddingModel;
 import dev.langchain4j.model.openai.OpenAiChatModel;
 import dev.langchain4j.model.openai.OpenAiEmbeddingModel;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -36,6 +38,7 @@ public class OpenAiBeansConfig {
     }
 
     @Bean
+    @ConditionalOnProperty(name = "app.embedding.provider", havingValue = "openrouter", matchIfMissing = true)
     EmbeddingModel embeddingModel(
             @Value("${langchain4j.open-ai.embedding-model.api-key:}") String apiKey,
             @Value("${langchain4j.open-ai.embedding-model.base-url:}") String baseUrl,
@@ -58,5 +61,11 @@ public class OpenAiBeansConfig {
             builder.baseUrl(baseUrl.trim());
         }
         return builder.build();
+    }
+
+    @Bean
+    @ConditionalOnProperty(name = "app.embedding.provider", havingValue = "local-bge")
+    EmbeddingModel bgeEmbeddingModel() {
+        return new BgeSmallEnV15QuantizedEmbeddingModel();
     }
 }

@@ -27,6 +27,7 @@ import {
 import type { TableProps, TabsProps } from 'antd'
 import {
   CloudUploadOutlined,
+  MessageOutlined,
   DislikeOutlined,
   DownloadOutlined,
   EyeOutlined,
@@ -66,7 +67,16 @@ const DEFAULT_QUERY_PAGE_SIZE = 10
 const GLASS_CARD_CLASS = 'rounded-2xl border border-slate-200 bg-white shadow-sm'
 const MAX_UPLOAD_BATCH_BYTES = 25 * 1024 * 1024
 const MAX_UPLOAD_BATCH_FILES = 10
-const TAB_KEYS = ['ingest', 'query', 'match', 'candidates', 'compare', 'audit', 'eval'] as const
+const TAB_KEYS = ['ingest', 'chat', 'query', 'match', 'candidates', 'compare', 'audit', 'eval'] as const
+const CHAT_SAMPLE_QUESTIONS = [
+  'Find candidates for [ROLE] with [SKILL_1], [SKILL_2], and [SKILL_3].',
+  'List candidates in [LOCATION] with at least [MIN_YEARS] years of experience for [ROLE].',
+  'Who best matches [ROLE] with must-have skills: [MUST_HAVE_SKILLS]?',
+  'Show candidates suitable for [ROLE_A] or [ROLE_B], ranked by fit and explain why.',
+  'Is [CANDIDATE_NAME] in our records?',
+  'Compare top candidates for [ROLE] based on [CRITERIA_1], [CRITERIA_2], and [CRITERIA_3].',
+  'Which candidates have experience with [TECH_STACK] and are open to [WORK_MODE_OR_LOCATION]?',
+] as const
 type TabKey = typeof TAB_KEYS[number]
 
 type StructuredAnswer = {
@@ -88,8 +98,23 @@ type SavedQuery = {
   question: string
   maxResults: number
   minScore: number
-  scopeId?: string
   createdAt: string
+}
+
+type ChatMessage = {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  sources?: SourceSegment[]
+  sourcePaging?: {
+    query: string
+    maxResults: number
+    minScore: number
+    pageSize: number
+    loadedPage: number
+    totalSources: number
+    useFeedbackTuning: boolean
+  }
 }
 
 function parseTabRouteFromHash(hashValue: string): { tab: TabKey; candidateId?: string } {
@@ -234,6 +259,27 @@ function groupBySource(sources: SourceSegment[]): GroupedSource[] {
     }
   }
   return Array.from(grouped.values()).sort((a, b) => b.bestScore - a.bestScore || b.count - a.count)
+}
+
+function buildChatQuestion(history: ChatMessage[], userQuestion: string): string {
+  const cleanQuestion = userQuestion.trim()
+  if (!cleanQuestion) return ''
+  const recentTurns = history.slice(-6)
+  if (recentTurns.length === 0) {
+    return cleanQuestion
+  }
+  const conversation = recentTurns
+    .map((turn) => `${turn.role === 'user' ? 'User' : 'Assistant'}: ${truncateText(turn.content.replace(/\s+/g, ' ').trim(), 320)}`)
+    .join('\n')
+  return `Conversation context:\n${conversation}\n\nCurrent question:\n${cleanQuestion}`
+}
+
+function topChatSources(sources: SourceSegment[], limit?: number): SourceSegment[] {
+  const ordered = [...(sources ?? [])].sort((a, b) => a.rank - b.rank || b.score - a.score)
+  if (typeof limit === 'number') {
+    return ordered.slice(0, Math.max(1, limit))
+  }
+  return ordered
 }
 
 function chunkItems<T>(items: T[], chunkSize: number): T[][] {
@@ -441,13 +487,401 @@ function CandidateInfoCard({
   )
 }
 
+function ChatTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) => void }) {
+  const screens = useBreakpoint()
+  const isMobile = !screens.md
+  const [question, setQuestion] = useState('')
+  const [maxResults, setMaxResults] = useState(40)
+  const [minScore, setMinScore] = useState(0.75)
+  const [useFeedbackTuning, setUseFeedbackTuning] = useState(true)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [sourceVisibleCountByMessage, setSourceVisibleCountByMessage] = useState<Record<string, number>>({})
+  const [loadingMoreSourcesByMessage, setLoadingMoreSourcesByMessage] = useState<Record<string, boolean>>({})
+  const [chatCandidateNameById, setChatCandidateNameById] = useState<Record<string, string>>({})
+
+  useEffect(() => {
+    const candidateIds = Array.from(
+      new Set(
+        messages
+          .flatMap((message) => message.sources ?? [])
+          .map((source) => source.candidateId)
+          .filter(Boolean)
+      )
+    )
+    if (candidateIds.length === 0) return
+    const missing = candidateIds.filter((id) => !chatCandidateNameById[id])
+    if (missing.length === 0) return
+
+    let cancelled = false
+    void Promise.all(
+      missing.map(async (candidateId) => {
+        try {
+          const candidate = await fetchCandidate(candidateId)
+          return { candidateId, name: candidate.displayName || candidateId } as const
+        } catch {
+          return { candidateId, name: candidateId } as const
+        }
+      })
+    ).then((resolved) => {
+      if (cancelled) return
+      setChatCandidateNameById((prev) => {
+        const next = { ...prev }
+        for (const item of resolved) {
+          next[item.candidateId] = item.name
+        }
+        return next
+      })
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [messages, chatCandidateNameById])
+
+  async function loadMoreSourcesForMessage(messageId: string) {
+    const message = messages.find((item) => item.id === messageId && item.role === 'assistant')
+    if (!message?.sourcePaging) return
+    const loadedSources = message.sources ?? []
+    if (loadedSources.length >= message.sourcePaging.totalSources) return
+
+    const nextPage = message.sourcePaging.loadedPage + 1
+    setLoadingMoreSourcesByMessage((prev) => ({ ...prev, [messageId]: true }))
+    try {
+      const response = await querySkills(message.sourcePaging.query, {
+        maxResults: message.sourcePaging.maxResults,
+        minScore: message.sourcePaging.minScore,
+        page: nextPage,
+        pageSize: message.sourcePaging.pageSize,
+        useFeedbackTuning: message.sourcePaging.useFeedbackTuning,
+      })
+      setMessages((prev) => prev.map((item) => {
+        if (item.id !== messageId || item.role !== 'assistant') return item
+        const existing = item.sources ?? []
+        const incoming = response.sources ?? []
+        const byKey = new Map<string, SourceSegment>()
+        for (const source of [...existing, ...incoming]) {
+          const key = `${source.rank}:${source.source}:${source.candidateId}`
+          byKey.set(key, source)
+        }
+        return {
+          ...item,
+          sources: Array.from(byKey.values()).sort((a, b) => a.rank - b.rank || b.score - a.score),
+          sourcePaging: {
+            ...(item.sourcePaging ?? message.sourcePaging),
+            loadedPage: Math.max(item.sourcePaging?.loadedPage ?? 1, response.page ?? nextPage),
+            totalSources: response.totalSources ?? (item.sourcePaging?.totalSources ?? message.sourcePaging.totalSources),
+          },
+        }
+      }))
+    } catch {
+      setError('Failed to load more sources for this response')
+    } finally {
+      setLoadingMoreSourcesByMessage((prev) => ({ ...prev, [messageId]: false }))
+    }
+  }
+
+  async function onShowMoreSources(message: ChatMessage) {
+    if (message.role !== 'assistant') return
+    const visibleCount = sourceVisibleCountByMessage[message.id] ?? 4
+    const orderedSources = topChatSources(message.sources ?? [])
+    if (visibleCount < orderedSources.length) {
+      setSourceVisibleCountByMessage((prev) => ({
+        ...prev,
+        [message.id]: Math.min((prev[message.id] ?? 4) + 4, orderedSources.length),
+      }))
+      return
+    }
+    const paging = message.sourcePaging
+    if (!paging || orderedSources.length >= paging.totalSources) return
+    await loadMoreSourcesForMessage(message.id)
+    setSourceVisibleCountByMessage((prev) => ({
+      ...prev,
+      [message.id]: (prev[message.id] ?? 4) + 4,
+    }))
+  }
+
+  async function sendMessage() {
+    const rawQuestion = question.trim()
+    if (!rawQuestion || loading) return
+    const nextUserMessage: ChatMessage = {
+      id: `u-${Date.now()}`,
+      role: 'user',
+      content: rawQuestion,
+    }
+    const nextMessages = [...messages, nextUserMessage]
+    setMessages(nextMessages)
+    setQuestion('')
+    setLoading(true)
+    setError(null)
+    try {
+      const conversationQuestion = buildChatQuestion(nextMessages, rawQuestion)
+      const response = await querySkills(conversationQuestion, {
+        maxResults,
+        minScore,
+        page: 1,
+        pageSize: 8,
+        useFeedbackTuning,
+      })
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `a-${Date.now()}`,
+          role: 'assistant',
+          content: response.answer,
+          sources: response.sources,
+          sourcePaging: {
+            query: conversationQuestion,
+            maxResults,
+            minScore,
+            pageSize: response.pageSize ?? 8,
+            loadedPage: response.page ?? 1,
+            totalSources: response.totalSources ?? (response.sources?.length ?? 0),
+            useFeedbackTuning,
+          },
+        },
+      ])
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Chat query failed')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <Space direction="vertical" size="middle" className="w-full">
+      <Card
+        className={GLASS_CARD_CLASS}
+        title="Talent Assistant Chat"
+        extra={(
+          <Space>
+            <Button onClick={() => setUseFeedbackTuning((prev) => !prev)}>
+              Feedback Tuning: {useFeedbackTuning ? 'On' : 'Off'}
+            </Button>
+            <Button onClick={() => { setMessages([]); setError(null); setSourceVisibleCountByMessage({}); setLoadingMoreSourcesByMessage({}) }} disabled={messages.length === 0 || loading}>
+              New Chat
+            </Button>
+          </Space>
+        )}
+      >
+        <Row gutter={[16, 16]} align="top">
+          <Col xs={24} xl={16}>
+            <Space direction="vertical" size="middle" className="w-full">
+              <Paragraph type="secondary" className="mb-0">
+                Ask naturally about candidates, skills, roles, years of experience, location, and profile fit. Responses include grounded sources.
+              </Paragraph>
+              <div className="max-h-[640px] space-y-3 overflow-y-auto rounded-xl border border-slate-200 bg-slate-50 p-3">
+                {messages.length === 0 ? (
+                  <Empty description="Start a conversation with the talent assistant" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                ) : (
+                  messages.map((message) => {
+                    const structured = message.role === 'assistant' ? parseStructuredAnswer(message.content) : null
+                    const rankedSources = message.role === 'assistant' ? topChatSources(message.sources ?? []) : []
+                    const visibleCount = sourceVisibleCountByMessage[message.id] ?? 4
+                    const visibleSources = rankedSources.slice(0, visibleCount)
+                    const hasMoreLoadedSources = visibleCount < rankedSources.length
+                    const totalAvailableSources = message.sourcePaging?.totalSources ?? rankedSources.length
+                    const hasMoreServerSources = rankedSources.length < totalAvailableSources
+                    const canShowLessSources = rankedSources.length > 4 && visibleCount > 4
+                    return (
+                      <div
+                        key={message.id}
+                        className={message.role === 'user' ? 'flex justify-end' : 'flex justify-start'}
+                      >
+                        <div className={message.role === 'user'
+                          ? 'max-w-[85%] rounded-2xl bg-emerald-600 px-4 py-3 text-white shadow-sm'
+                          : 'max-w-[90%] rounded-2xl border border-slate-200 bg-white px-4 py-3 text-slate-900 shadow-sm'}
+                        >
+                          {message.role === 'assistant' && structured ? (
+                            <Space direction="vertical" size={6} className="w-full">
+                              <Paragraph className="mb-0 whitespace-pre-wrap">{structured.answer}</Paragraph>
+                              {structured.keyFindings.length > 0 && (
+                                <div>
+                                  <Text strong>Key findings</Text>
+                                  <List
+                                    size="small"
+                                    dataSource={structured.keyFindings}
+                                    renderItem={(item, index) => <List.Item key={`${message.id}-k-${index}`}>{item}</List.Item>}
+                                  />
+                                </div>
+                              )}
+                            </Space>
+                          ) : (
+                            <Paragraph className="mb-0 whitespace-pre-wrap">{message.content}</Paragraph>
+                          )}
+                          {message.role === 'assistant' && (message.sources?.length ?? 0) > 0 && (
+                            <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-2">
+                              <div className="mb-2 flex items-center justify-between">
+                                <Text strong>Top Sources</Text>
+                                <Tag>{visibleSources.length}/{totalAvailableSources}</Tag>
+                              </div>
+                              <List
+                                size="small"
+                                dataSource={visibleSources}
+                                renderItem={(source) => (
+                                  <List.Item
+                                    key={`${message.id}-${source.rank}-${source.source}-${source.candidateId}`}
+                                    className="px-0"
+                                    actions={[
+                                      source.source
+                                        ? (
+                                          <Button size="small" icon={<EyeOutlined />} href={resumeViewUrl(source.source)} target="_blank">
+                                            View
+                                          </Button>
+                                        )
+                                        : null,
+                                      source.source
+                                        ? (
+                                          <Button size="small" icon={<DownloadOutlined />} href={resumeDownloadUrl(source.source)}>
+                                            PDF
+                                          </Button>
+                                        )
+                                        : null,
+                                      source.candidateId
+                                        ? (
+                                          <Button size="small" icon={<UserOutlined />} onClick={() => onOpenCandidate(source.candidateId)}>
+                                            Candidate
+                                          </Button>
+                                        )
+                                        : null,
+                                    ].filter(Boolean)}
+                                  >
+                                    <Space direction="vertical" size={2} className="w-full">
+                                      <Space wrap size={6}>
+                                        <Tag color="blue">#{source.rank}</Tag>
+                                        <Tag color={scoreTagColor(source.score)}>{source.score.toFixed(3)}</Tag>
+                                      </Space>
+                                      <Text strong>
+                                        {source.candidateId
+                                          ? truncateText(chatCandidateNameById[source.candidateId] ?? source.candidateId, isMobile ? 28 : 44)
+                                          : truncateText(source.source || 'Unknown source', isMobile ? 28 : 44)}
+                                      </Text>
+                                      <Text type="secondary">
+                                        {truncateText(source.source || 'Unknown source', isMobile ? 30 : 52)}
+                                      </Text>
+                                    </Space>
+                                  </List.Item>
+                                )}
+                              />
+                              {(hasMoreLoadedSources || hasMoreServerSources || canShowLessSources) && (
+                                <Space wrap className="mt-2">
+                                  {(hasMoreLoadedSources || hasMoreServerSources) && (
+                                    <Button
+                                      size="small"
+                                      loading={Boolean(loadingMoreSourcesByMessage[message.id])}
+                                      onClick={() => { void onShowMoreSources(message) }}
+                                    >
+                                      Show more
+                                    </Button>
+                                  )}
+                                  {canShowLessSources && (
+                                    <Button
+                                      size="small"
+                                      onClick={() => setSourceVisibleCountByMessage((prev) => ({
+                                        ...prev,
+                                        [message.id]: 4,
+                                      }))}
+                                    >
+                                      Show less
+                                    </Button>
+                                  )}
+                                </Space>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })
+                )}
+                {loading && (
+                  <div className="flex justify-start">
+                    <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
+                      <Text type="secondary">Thinking...</Text>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <Space.Compact className="w-full">
+                <Input
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  onPressEnter={() => { void sendMessage() }}
+                  placeholder="Ask about candidates, role fit, skills, years, location, or comparisons..."
+                  disabled={loading}
+                  allowClear
+                />
+                <Button type="primary" icon={<SendOutlined />} loading={loading} onClick={() => { void sendMessage() }}>
+                  Send
+                </Button>
+              </Space.Compact>
+              {error && <Alert type="error" showIcon message={error} />}
+            </Space>
+          </Col>
+
+          <Col xs={24} xl={8}>
+            <Space direction="vertical" size="middle" className="w-full">
+              <Card size="small" className="rounded-xl border border-slate-200 bg-slate-50" title="Chat Settings">
+                <Row gutter={[12, 12]}>
+                  <Col xs={24}>
+                    <Text type="secondary">Max sources</Text>
+                    <InputNumber
+                      min={1}
+                      max={MAX_RESULTS_CAP}
+                      value={maxResults}
+                      onChange={(value) => setMaxResults(value ?? 40)}
+                      className="mt-2 w-full"
+                    />
+                  </Col>
+                  <Col xs={24}>
+                    <Text type="secondary">Minimum score</Text>
+                    <InputNumber
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={minScore}
+                      onChange={(value) => setMinScore(value ?? 0.75)}
+                      className="mt-2 w-full"
+                    />
+                  </Col>
+                </Row>
+              </Card>
+              <Card
+                size="small"
+                className="rounded-xl border border-emerald-100 bg-emerald-50"
+                title="Sample Questions"
+              >
+                <List
+                  size="small"
+                  dataSource={CHAT_SAMPLE_QUESTIONS}
+                  renderItem={(sample, index) => (
+                    <List.Item
+                      key={`chat-sample-${index}`}
+                      actions={[
+                        <Button key={`chat-sample-use-${index}`} size="small" onClick={() => setQuestion(sample)}>
+                          Use
+                        </Button>,
+                      ]}
+                    >
+                      <Text>{isMobile ? truncateText(sample, 92) : sample}</Text>
+                    </List.Item>
+                  )}
+                />
+              </Card>
+            </Space>
+          </Col>
+        </Row>
+      </Card>
+    </Space>
+  )
+}
+
 function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) => void }) {
   const screens = useBreakpoint()
   const isMobile = !screens.md
   const [question, setQuestion] = useState('')
   const [activeQuestion, setActiveQuestion] = useState('')
-  const [scopeId, setScopeId] = useState('')
-  const [activeScopeId, setActiveScopeId] = useState('')
   const [maxResults, setMaxResults] = useState(60)
   const [minScore, setMinScore] = useState(0.75)
   const [useFeedbackTuning, setUseFeedbackTuning] = useState(true)
@@ -557,7 +991,6 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
     saveQuery: boolean
     overrideMaxResults?: number
     overrideMinScore?: number
-    overrideScopeId?: string
   }) {
     if (!params.q.trim()) return
     setLoading(true)
@@ -565,18 +998,15 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
     try {
       const effectiveMaxResults = params.overrideMaxResults ?? maxResults
       const effectiveMinScore = params.overrideMinScore ?? minScore
-      const effectiveScopeId = (params.overrideScopeId ?? scopeId).trim()
       const data = await querySkills(params.q.trim(), {
         maxResults: effectiveMaxResults,
         minScore: effectiveMinScore,
         page: params.page,
         pageSize: params.pageSize,
         useFeedbackTuning,
-        scopeId: effectiveScopeId || undefined,
       })
       setResult(data)
       setActiveQuestion(params.q.trim())
-      setActiveScopeId(effectiveScopeId)
       setFeedbackNotes('')
       if (params.saveQuery) {
         const next: SavedQuery[] = [
@@ -585,14 +1015,9 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
             question: params.q.trim(),
             maxResults: effectiveMaxResults,
             minScore: effectiveMinScore,
-            scopeId: effectiveScopeId || undefined,
             createdAt: new Date().toISOString(),
           },
-          ...savedQueries.filter((item) => {
-            const sameQuestion = item.question.trim().toLowerCase() === params.q.trim().toLowerCase()
-            const sameScope = (item.scopeId ?? '').trim().toLowerCase() === effectiveScopeId.toLowerCase()
-            return !(sameQuestion && sameScope)
-          }),
+          ...savedQueries.filter((item) => item.question.trim().toLowerCase() !== params.q.trim().toLowerCase()),
         ]
         persistSavedQueries(next)
       }
@@ -748,7 +1173,6 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 page,
                 pageSize,
                 saveQuery: false,
-                overrideScopeId: activeScopeId,
               })
             }}
           />
@@ -831,7 +1255,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
             Search all qualifying resume segments with ranked evidence and open candidate profiles directly.
           </Paragraph>
           <Row gutter={[12, 12]}>
-            <Col xs={24} lg={12}>
+            <Col xs={24} lg={14}>
               <Space.Compact className="w-full">
                 <Input
                   size="large"
@@ -851,7 +1275,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 </Button>
               </Space.Compact>
             </Col>
-            <Col xs={12} lg={4}>
+            <Col xs={12} lg={5}>
               <Text type="secondary">Max sources</Text>
               <InputNumber
                 min={1}
@@ -861,7 +1285,7 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 className="mt-2 w-full"
               />
             </Col>
-            <Col xs={12} lg={4}>
+            <Col xs={12} lg={5}>
               <Text type="secondary">Minimum score</Text>
               <InputNumber
                 min={0}
@@ -884,16 +1308,6 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                 Use feedback recommendation
               </Button>
             </Col>
-            <Col xs={24} lg={4}>
-              <Text type="secondary">Scope (optional)</Text>
-              <Input
-                value={scopeId}
-                onChange={(e) => setScopeId(e.target.value)}
-                className="mt-2 w-full"
-                placeholder="e.g. tenant-a"
-                allowClear
-              />
-            </Col>
           </Row>
           <Space wrap>
             <Button type={useFeedbackTuning ? 'primary' : 'default'} onClick={() => setUseFeedbackTuning((prev) => !prev)}>
@@ -914,7 +1328,6 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                       setQuestion(item.question)
                       setMaxResults(item.maxResults)
                       setMinScore(item.minScore)
-                      setScopeId(item.scopeId ?? '')
                       void runQuery({
                         q: item.question,
                         page: 1,
@@ -922,7 +1335,6 @@ function QueryTab({ onOpenCandidate }: { onOpenCandidate: (candidateId: string) 
                         saveQuery: false,
                         overrideMaxResults: item.maxResults,
                         overrideMinScore: item.minScore,
-                        overrideScopeId: item.scopeId,
                       })
                     }}
                   >
@@ -2137,6 +2549,16 @@ export default function App() {
                 key: 'ingest',
                 label: 'Ingest',
                 children: <IngestTab />,
+              },
+              {
+                key: 'chat',
+                label: (
+                  <Space size={6}>
+                    <MessageOutlined />
+                    Chat
+                  </Space>
+                ),
+                children: <ChatTab onOpenCandidate={openCandidate} />,
               },
               {
                 key: 'query',

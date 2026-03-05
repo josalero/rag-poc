@@ -278,6 +278,339 @@ class RagServiceTest {
     }
 
     @Test
+    void query_withCandidateExistenceQuestion_returnsYesFromCandidateIndexWithoutRetriever() {
+        RagService candidateAwareService = new RagService(
+                embeddingStore,
+                embeddingModel,
+                chatModel,
+                candidateProfileService,
+                null,
+                null,
+                50,
+                200,
+                0.75d,
+                "No relevant context found.",
+                null,
+                null,
+                null
+        );
+
+        CandidateProfile jose = candidateProfile("candidate-jose", "Jose Adrian Aleman Rojas");
+        when(candidateProfileService.allCandidates()).thenReturn(List.of(jose));
+
+        QueryResponse response = candidateAwareService.query("Is Jose Aleman in our database?", null, null, 1, 10, false);
+
+        assertThat(response.answer()).contains("Yes");
+        assertThat(response.answer()).contains("Jose");
+        assertThat(response.totalSources()).isEqualTo(1);
+        assertThat(response.sources()).hasSize(1);
+        assertThat(response.sources().get(0).candidateId()).isEqualTo("candidate-jose");
+        verifyNoInteractions(embeddingModel);
+        verifyNoInteractions(embeddingStore);
+        verifyNoInteractions(chatModel);
+    }
+
+    @Test
+    void query_withCandidateExistenceQuestion_returnsNoWhenMissingWithoutRetriever() {
+        RagService candidateAwareService = new RagService(
+                embeddingStore,
+                embeddingModel,
+                chatModel,
+                candidateProfileService,
+                null,
+                null,
+                50,
+                200,
+                0.75d,
+                "No relevant context found.",
+                null,
+                null,
+                null
+        );
+
+        when(candidateProfileService.allCandidates()).thenReturn(List.of(
+                candidateProfile("candidate-ana", "Ana Rodriguez Meza")
+        ));
+
+        QueryResponse response = candidateAwareService.query("Is Jose Aleman in our database?", null, null, 1, 10, false);
+
+        assertThat(response.answer()).contains("could not find");
+        assertThat(response.totalSources()).isZero();
+        assertThat(response.sources()).isEmpty();
+        verifyNoInteractions(embeddingModel);
+        verifyNoInteractions(embeddingStore);
+        verifyNoInteractions(chatModel);
+    }
+
+    @Test
+    void query_withCandidateExistenceQuestionUsingRecordsPhrasing_returnsYesWithoutRetriever() {
+        RagService candidateAwareService = new RagService(
+                embeddingStore,
+                embeddingModel,
+                chatModel,
+                candidateProfileService,
+                null,
+                null,
+                50,
+                200,
+                0.75d,
+                "No relevant context found.",
+                null,
+                null,
+                null
+        );
+
+        CandidateProfile victor = candidateProfile("candidate-victor", "Victor Arias");
+        when(candidateProfileService.allCandidates()).thenReturn(List.of(victor));
+
+        QueryResponse response = candidateAwareService.query("Is Victor Arias in our records?", null, null, 1, 10, false);
+
+        assertThat(response.answer()).contains("Yes");
+        assertThat(response.answer()).contains("Victor Arias");
+        assertThat(response.totalSources()).isEqualTo(1);
+        assertThat(response.sources()).hasSize(1);
+        assertThat(response.sources().get(0).candidateId()).isEqualTo("candidate-victor");
+        verifyNoInteractions(embeddingModel);
+        verifyNoInteractions(embeddingStore);
+        verifyNoInteractions(chatModel);
+    }
+
+    @Test
+    void query_withExistenceQuestionResolvedByLlmFallback_returnsYesWithoutRetriever() {
+        RagService candidateAwareService = new RagService(
+                embeddingStore,
+                embeddingModel,
+                chatModel,
+                candidateProfileService,
+                null,
+                null,
+                50,
+                200,
+                0.75d,
+                "No relevant context found.",
+                null,
+                null,
+                null
+        );
+
+        CandidateProfile victor = candidateProfile("candidate-victor", "Victor Arias");
+        when(candidateProfileService.allCandidates()).thenReturn(List.of(victor));
+        when(chatModel.chat(anyString())).thenReturn("{\"isExistenceQuery\":true,\"targetName\":\"Victor Arias\"}");
+
+        QueryResponse response = candidateAwareService.query("Could you verify whether Victor Arias exists on file?", null, null, 1, 10, false);
+
+        assertThat(response.answer()).contains("Yes");
+        assertThat(response.answer()).contains("Victor Arias");
+        assertThat(response.totalSources()).isEqualTo(1);
+        assertThat(response.sources()).hasSize(1);
+        assertThat(response.sources().get(0).candidateId()).isEqualTo("candidate-victor");
+        verifyNoInteractions(embeddingModel);
+        verifyNoInteractions(embeddingStore);
+        verify(chatModel, times(1)).chat(anyString());
+    }
+
+    @Test
+    void query_withChatWrappedCurrentQuestion_resolvesCandidateExistenceFromCurrentQuestion() {
+        RagService candidateAwareService = new RagService(
+                embeddingStore,
+                embeddingModel,
+                chatModel,
+                candidateProfileService,
+                null,
+                null,
+                50,
+                200,
+                0.75d,
+                "No relevant context found.",
+                null,
+                null,
+                null
+        );
+
+        CandidateProfile jose = candidateProfile("candidate-jose", "Jose Adrian Aleman Rojas");
+        when(candidateProfileService.allCandidates()).thenReturn(List.of(jose));
+
+        String wrappedQuestion = """
+                Conversation context:
+                User: previous message
+                Assistant: previous response
+
+                Current question:
+                Is Jose Aleman in our records?
+                """;
+
+        QueryResponse response = candidateAwareService.query(wrappedQuestion, null, null, 1, 10, false);
+
+        assertThat(response.answer()).contains("Yes");
+        assertThat(response.answer()).contains("Jose Aleman");
+        assertThat(response.totalSources()).isEqualTo(1);
+        assertThat(response.sources()).hasSize(1);
+        assertThat(response.sources().get(0).candidateId()).isEqualTo("candidate-jose");
+        verifyNoInteractions(embeddingModel);
+        verifyNoInteractions(embeddingStore);
+        verifyNoInteractions(chatModel);
+    }
+
+    @Test
+    void query_withSkillsLocationAndYears_filtersCandidatesDeterministically() {
+        RagService candidateAwareService = new RagService(
+                embeddingStore,
+                embeddingModel,
+                chatModel,
+                candidateProfileService,
+                null,
+                null,
+                50,
+                200,
+                0.75d,
+                "No relevant context found.",
+                null,
+                null,
+                null
+        );
+
+        CandidateProfile jose = new CandidateProfile(
+                "candidate-jose",
+                "jose.pdf",
+                List.of("jose.pdf"),
+                "Jose Adrian Aleman Rojas",
+                "jose@example.com",
+                "+50670001111",
+                "",
+                "",
+                "",
+                List.of("REACT", "TYPESCRIPT", "AWS"),
+                List.of("REACT", "TYPESCRIPT", "AWS"),
+                List.of("Senior Full-Stack Engineer"),
+                7,
+                "San Jose, Costa Rica",
+                1024L,
+                Instant.now(),
+                Instant.now(),
+                "Full-stack candidate profile",
+                List.of()
+        );
+        CandidateProfile other = new CandidateProfile(
+                "candidate-other",
+                "other.pdf",
+                List.of("other.pdf"),
+                "Mario Perez",
+                "mario@example.com",
+                "+52550001111",
+                "",
+                "",
+                "",
+                List.of("REACT", "NODE"),
+                List.of("REACT", "NODE"),
+                List.of("Intermediate Full-Stack Engineer"),
+                3,
+                "Monterrey, Mexico",
+                1024L,
+                Instant.now(),
+                Instant.now(),
+                "Another profile",
+                List.of()
+        );
+        when(candidateProfileService.allCandidates()).thenReturn(List.of(jose, other));
+
+        QueryResponse response = candidateAwareService.query(
+                "I need candidates with React in Costa Rica with at least 5 years of experience",
+                null,
+                null,
+                1,
+                10,
+                false
+        );
+
+        assertThat(response.answer()).contains("Found 1 candidate");
+        assertThat(response.totalSources()).isEqualTo(1);
+        assertThat(response.sources()).hasSize(1);
+        assertThat(response.sources().get(0).candidateId()).isEqualTo("candidate-jose");
+        verifyNoInteractions(embeddingModel);
+        verifyNoInteractions(embeddingStore);
+        verifyNoInteractions(chatModel);
+    }
+
+    @Test
+    void query_withRoleQuestion_filtersCandidatesByRoleDeterministically() {
+        RagService candidateAwareService = new RagService(
+                embeddingStore,
+                embeddingModel,
+                chatModel,
+                candidateProfileService,
+                null,
+                null,
+                50,
+                200,
+                0.75d,
+                "No relevant context found.",
+                null,
+                null,
+                null
+        );
+
+        CandidateProfile qa = new CandidateProfile(
+                "candidate-qa",
+                "qa.pdf",
+                List.of("qa.pdf"),
+                "Ricardo Jarquin",
+                "ricardo@example.com",
+                "+50680001111",
+                "",
+                "",
+                "",
+                List.of("QA", "TEST AUTOMATION", "SELENIUM"),
+                List.of("QA", "TEST AUTOMATION", "SELENIUM"),
+                List.of("Senior QA / Test Engineer"),
+                8,
+                "San Jose, Costa Rica",
+                1024L,
+                Instant.now(),
+                Instant.now(),
+                "QA profile",
+                List.of()
+        );
+        CandidateProfile dev = new CandidateProfile(
+                "candidate-dev",
+                "dev.pdf",
+                List.of("dev.pdf"),
+                "Carlos Pineda",
+                "carlos@example.com",
+                "+50498073391",
+                "",
+                "",
+                "",
+                List.of("JAVA", "SPRING"),
+                List.of("JAVA", "SPRING"),
+                List.of("Senior Backend Engineer"),
+                6,
+                "San Pedro Sula, Honduras",
+                1024L,
+                Instant.now(),
+                Instant.now(),
+                "Backend profile",
+                List.of()
+        );
+        when(candidateProfileService.allCandidates()).thenReturn(List.of(qa, dev));
+
+        QueryResponse response = candidateAwareService.query(
+                "Show candidates for QA / Test Engineer role",
+                null,
+                null,
+                1,
+                10,
+                false
+        );
+
+        assertThat(response.totalSources()).isEqualTo(1);
+        assertThat(response.sources()).hasSize(1);
+        assertThat(response.sources().get(0).candidateId()).isEqualTo("candidate-qa");
+        verifyNoInteractions(embeddingModel);
+        verifyNoInteractions(embeddingStore);
+        verifyNoInteractions(chatModel);
+    }
+
+    @Test
     void query_withIntentPhrasing_doesNotPenalizeReactSkillLookup() {
         Embedding queryEmbedding = new Embedding(new float[]{0.5f});
         TextSegment segment = TextSegment.from("Frontend engineer with React and TypeScript experience.");
